@@ -10,6 +10,8 @@ GitHub Actions builds, tests, and lints every push and pull request. Download th
 
 The `main` and tagged APKs use the same debug signing key as the local build, so they can update the installed app. The key is stored as a GitHub Actions secret and is unavailable to pull requests. Keep a backup of the signing key; a different key cannot update existing installs.
 
+On Home, tap **Check for updates** to compare the installed version with the latest published GitHub Release. If a newer release has a `JobTracker-vX.Y.Z-debug.apk` asset, tap **Download APK** and then the completed download notification to install it. Android may ask you to allow installs from the Downloads app. Checking requires an internet connection; jobs remain available offline.
+
 ## Job sharing
 
 Job sharing uses an offline, text-only QR snapshot. It includes client names and numbers, site address, start/end dates, work details, inventory, and outside-worker assignments. It **does not include photos or private costs**. A job whose text exceeds the QR size limit cannot generate a code until some text is shortened. No account or internet connection is required.

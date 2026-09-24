@@ -74,6 +74,8 @@ class MainActivity : ComponentActivity() {
         var photoPath by remember { mutableStateOf<String?>(null) }
         var costs by remember { mutableStateOf<List<CostItem>>(emptyList()) }
         var scanRaw by rememberSaveable { mutableStateOf("") }
+        var checkingUpdate by remember { mutableStateOf(false) }
+        var latestRelease by remember { mutableStateOf<GitHubRelease?>(null) }
         val scanPreview = remember(scanRaw) { runCatching { if (scanRaw.isBlank()) null else JSONObject(scanRaw).getJSONObject("job").toJob() }.getOrNull() }
         val scanSource = remember(scanRaw) { runCatching { JSONObject(scanRaw).getString("source") }.getOrDefault("") }
         val scope = rememberCoroutineScope()
@@ -159,6 +161,19 @@ class MainActivity : ComponentActivity() {
             }
         }
         fun scan() { scanner.launch(ScanOptions().setCaptureActivity(JobScannerActivity::class.java).setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Scan a JobTracker job QR code").setBeepEnabled(false).setOrientationLocked(false)) }
+        fun checkForUpdate() {
+            if (checkingUpdate) return
+            checkingUpdate = true
+            scope.launch {
+                try {
+                    latestRelease = fetchLatestRelease()
+                } catch (e: Exception) {
+                    message = e.message ?: "Could not check GitHub for updates. Check your connection and try again."
+                } finally {
+                    checkingUpdate = false
+                }
+            }
+        }
 
         BackHandler(screen != "home") { back() }
         Scaffold(containerColor = UiCanvas, topBar = {
@@ -179,6 +194,7 @@ class MainActivity : ComponentActivity() {
             when (screen) {
                 "home" -> HomeScreen(jobs, draft != null, area, onNew = { if (draft == null) openEditor() else replaceDraft = true }, onResume = { openEditor() },
                     onOpen = { selectedId = it; screen = "detail" }, onHistory = { screen = "history" }, onScan = { scan() },
+                    onCheckUpdate = { checkForUpdate() },
                     onReorder = { from, to ->
                         persist(reorderVisibleJobs(jobs, from, to))
                     })
@@ -261,6 +277,30 @@ class MainActivity : ComponentActivity() {
         photoPath?.let { path -> AlertDialog(onDismissRequest = { photoPath = null },
             text = { PhotoImage(path, Modifier.fillMaxWidth().height(350.dp)) },
             confirmButton = { TextButton(onClick = { photoPath = null }) { Text("Close") } }) }
+        if (checkingUpdate) AlertDialog(onDismissRequest = {}, title = { Text("Checking GitHub") },
+            text = { CircularProgressIndicator() }, confirmButton = {})
+        latestRelease?.let { release ->
+            val installedVersion = packageManager.getPackageInfo(packageName, 0).versionName.orEmpty()
+            val newer = isNewerRelease(release.tag, installedVersion)
+            AlertDialog(onDismissRequest = { latestRelease = null },
+                title = { Text(if (newer) "Update available" else "JobTracker is up to date") },
+                text = { Text("Installed: v$installedVersion\nLatest release: ${release.tag}" +
+                    if (newer) "\n\nDownload the APK, then tap the completed download notification to install it." else "") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        if (newer) {
+                            try {
+                                downloadRelease(this@MainActivity, release)
+                                message = "Downloading ${release.tag}. Tap its notification when the download finishes to install it."
+                            } catch (e: Exception) {
+                                message = e.message ?: "Could not start the download."
+                            }
+                        }
+                        latestRelease = null
+                    }) { Text(if (newer) "Download APK" else "OK") }
+                },
+                dismissButton = if (newer) ({ TextButton(onClick = { latestRelease = null }) { Text("Cancel") } }) else null)
+        }
         if (message.isNotBlank()) AlertDialog(onDismissRequest = { message = "" }, title = { Text("JobTracker") },
             text = { Text(message) }, confirmButton = { TextButton(onClick = { message = "" }) { Text("OK") } })
     }

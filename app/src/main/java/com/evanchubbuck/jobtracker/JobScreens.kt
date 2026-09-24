@@ -49,7 +49,8 @@ private fun PageTitle(title: String, subtitle: String) {
 
 @Composable
 internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, onNew: () -> Unit, onResume: () -> Unit,
-    onOpen: (String) -> Unit, onHistory: () -> Unit, onScan: () -> Unit, onReorder: (Int, Int) -> Unit) {
+    onOpen: (String) -> Unit, onHistory: () -> Unit, onScan: () -> Unit, onCheckUpdate: () -> Unit,
+    onReorder: (Int, Int) -> Unit) {
     val visible = jobs.filter { it.state != Job.COMPLETED }.sortedBy { it.priority }
     Column(modifier.padding(20.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -119,6 +120,7 @@ internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, 
             }
         }
         OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) { Text("Scan job QR") }
+        TextButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) { Text("Check for updates") }
     }
 }
 
