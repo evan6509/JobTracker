@@ -21,7 +21,7 @@ Creating a job does not automatically make it active. After setup, if no job is 
 
 When there are no active or planned jobs, show gray text reading exactly **“no jobs planned”** and a **“New Job”** button directly below it. Completed jobs do not prevent this empty state. A **Scan job QR** action is available from Home, including the empty state.
 
-When jobs exist, show one movable tab/card per active or planned job. Each tab shows a short job identifier (for example, the client name or job title), the job state, and enough schedule/location information to distinguish similar jobs. The active job has a green border. Planned jobs have a gray or muted yellow border; the final color choice belongs in the visual design. State must also appear in text so it is understandable without color. A **“New Job”** action remains available.
+When jobs exist, display a series of cards from the top to the bottom of the screen, allowing for scrolling if there are many. Each card shows a short job identifier (such as the client name or job title), the job state, and sufficient schedule/location information to distinguish similar jobs. The active job has a green border. Planned jobs have a gray or muted yellow border; the final color choice is part of the visual design. The state must also be displayed in text to ensure it is understandable without relying on color. A ****“New Job”**** action remains available.
 
 Pressing a tab opens that job's detail screen. Dragging a tab changes its priority position and the order persists after the app closes. Dragging does not change which job is active.
 
