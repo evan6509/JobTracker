@@ -25,7 +25,6 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.content.ContextCompat
 import com.evanchubbuck.jobtracker.ui.theme.JobTrackerTheme
@@ -210,7 +209,7 @@ class MainActivity : ComponentActivity() {
                     if (screen != "home") TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }
                     Spacer(Modifier.weight(1f))
                     if (screen == "home") {
-                        Text(if (darkMode) "🌙" else "☀️", fontSize = 24.sp)
+                        Text(if (darkMode) "Dark mode" else "Light mode", color = UiCanvas)
                         Switch(checked = darkMode, onCheckedChange = onDarkMode,
                             modifier = Modifier.semantics { contentDescription = "Dark mode" })
                     } else if (screen == "detail") {
