@@ -2,13 +2,16 @@ package com.evanchubbuck.jobtracker
 
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.provider.CalendarContract
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
@@ -17,6 +20,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
 import com.evanchubbuck.jobtracker.ui.theme.JobTrackerTheme
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -30,9 +34,22 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val prefs = getSharedPreferences("job_tracker_settings", MODE_PRIVATE)
+        val initialDarkMode = prefs.getBoolean("dark_mode", true)
+        enableEdgeToEdge(
+            statusBarStyle = if (initialDarkMode) SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT)
+                else SystemBarStyle.dark(Color.TRANSPARENT),
+            navigationBarStyle = if (initialDarkMode) SystemBarStyle.dark(Color.TRANSPARENT)
+                else SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT)
+        )
         setContent {
-            val prefs = remember { getSharedPreferences("job_tracker_settings", MODE_PRIVATE) }
-            var darkMode by remember { mutableStateOf(prefs.getBoolean("dark_mode", true)) }
+            var darkMode by remember { mutableStateOf(initialDarkMode) }
+            SideEffect {
+                WindowCompat.getInsetsController(window, window.decorView).apply {
+                    isAppearanceLightStatusBars = darkMode
+                    isAppearanceLightNavigationBars = !darkMode
+                }
+            }
             JobTrackerTheme(darkTheme = darkMode) {
                 JobTrackerApp(darkMode) { enabled -> darkMode = enabled; prefs.edit().putBoolean("dark_mode", enabled).apply() }
             }
@@ -146,7 +163,7 @@ class MainActivity : ComponentActivity() {
         BackHandler(screen != "home") { back() }
         Scaffold(containerColor = UiCanvas, topBar = {
             Surface(color = UiInk) {
-                Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth().statusBarsPadding().padding(12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                     if (screen != "home") TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }
                     Spacer(Modifier.weight(1f))
                     if (screen == "home") {
