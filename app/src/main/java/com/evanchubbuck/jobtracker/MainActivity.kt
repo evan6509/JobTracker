@@ -322,13 +322,13 @@ class MainActivity : ComponentActivity() {
             AlertDialog(onDismissRequest = { latestRelease = null },
                 title = { Text(if (newer) "Update available" else "JobTracker is up to date") },
                 text = { Text("Installed: v$installedVersion\nLatest release: ${release.tag}" +
-                    if (newer) "\n\nDownload the APK, then tap the completed download notification to install it." else "") },
+                    if (newer) "\n\nDownload the APK, then tap the completed download notification to install it. Android may ask you to allow installs from JobTracker." else "") },
                 confirmButton = {
                     TextButton(onClick = {
                         if (newer) {
                             try {
                                 downloadRelease(this@MainActivity, release)
-                                message = "Downloading ${release.tag}. Tap its notification when the download finishes to install it."
+                                message = "Downloading ${release.tag}. Tap its notification when the download finishes to install it. Allow installs from JobTracker if Android asks."
                             } catch (e: Exception) {
                                 message = e.message ?: "Could not start the download."
                             }
