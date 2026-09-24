@@ -6,6 +6,8 @@ import org.json.JSONObject
 import java.util.UUID
 
 data class Person(val name: String = "", val phone: String = "", val work: String = "")
+data class InventoryItem(val name: String = "", val quantity: String = "", val notes: String = "")
+data class CostItem(val description: String = "", val amount: String = "")
 
 data class Job(
     val id: String = UUID.randomUUID().toString(),
@@ -18,9 +20,10 @@ data class Job(
     val address: String = "",
     val startDate: String = "",
     val startTime: String = "",
-    val durationMinutes: String = "",
+    val endDate: String = "",
     val timeZone: String = java.util.TimeZone.getDefault().id,
     val description: String = "",
+    val inventory: List<InventoryItem> = emptyList(),
     val workers: List<Person> = emptyList(),
     val photos: List<String> = emptyList(),
     val importedSource: String = ""
@@ -39,8 +42,18 @@ class JobStore(context: Context) {
 
     fun jobs(): List<Job> = readArray("jobs").mapNotNull { runCatching { it.toJob() }.getOrNull() }
     fun draft(): Job? = runCatching { prefs.getString("draft", null)?.let { JSONObject(it).toJob() } }.getOrNull()
-    fun draftStep(): Int = prefs.getInt("draft_step", 0).coerceIn(0, 6)
-    fun saveDraftStep(step: Int) { prefs.edit().putInt("draft_step", step.coerceIn(0, 6)).apply() }
+    fun draftStep(): Int = prefs.getInt("draft_step", 0).coerceIn(0, 7)
+    fun saveDraftStep(step: Int) { prefs.edit().putInt("draft_step", step.coerceIn(0, 7)).apply() }
+
+    fun costs(jobId: String): List<CostItem> = runCatching {
+        val array = JSONArray(prefs.getString("costs_$jobId", "[]"))
+        (0 until array.length()).mapNotNull { array.optJSONObject(it)?.let { row -> CostItem(row.optString("description"), row.optString("amount")) } }
+    }.getOrDefault(emptyList())
+
+    fun saveCosts(jobId: String, items: List<CostItem>) {
+        val array = JSONArray().apply { items.forEach { put(JSONObject().put("description", it.description).put("amount", it.amount)) } }
+        prefs.edit().putString("costs_$jobId", array.toString()).apply()
+    }
 
     fun saveDraft(job: Job?) {
         prefs.edit().apply {
@@ -63,6 +76,8 @@ class JobStore(context: Context) {
 
 private fun Person.toJson() = JSONObject().put("name", name).put("phone", phone).put("work", work)
 private fun JSONObject.toPerson() = Person(optString("name"), optString("phone"), optString("work"))
+private fun InventoryItem.toJson() = JSONObject().put("name", name).put("quantity", quantity).put("notes", notes)
+private fun JSONObject.toInventoryItem() = InventoryItem(optString("name"), optString("quantity"), optString("notes"))
 
 fun Job.toJson(includeLocalPhotos: Boolean = true) = JSONObject().apply {
     put("id", id)
@@ -75,9 +90,10 @@ fun Job.toJson(includeLocalPhotos: Boolean = true) = JSONObject().apply {
     put("address", address)
     put("startDate", startDate)
     put("startTime", startTime)
-    put("durationMinutes", durationMinutes)
+    put("endDate", endDate)
     put("timeZone", timeZone)
     put("description", description)
+    put("inventory", JSONArray().apply { inventory.forEach { put(it.toJson()) } })
     put("workers", JSONArray().apply { workers.forEach { put(it.toJson()) } })
     if (includeLocalPhotos) put("photos", JSONArray().apply { photos.forEach { put(it) } })
     put("importedSource", importedSource)
@@ -103,9 +119,15 @@ fun JSONObject.toJob(): Job {
         address = optString("address"),
         startDate = optString("startDate"),
         startTime = optString("startTime"),
-        durationMinutes = optString("durationMinutes"),
+        endDate = optString("endDate").ifBlank { legacyEndDate(optString("startDate"), optString("startTime"), optString("durationMinutes"), optString("timeZone", java.util.TimeZone.getDefault().id)) },
         timeZone = optString("timeZone", java.util.TimeZone.getDefault().id),
-        description = optString("description"),
+        description = optString("description").let { existing ->
+            val oldDuration = optString("durationMinutes")
+            if (optString("startDate").isBlank() && oldDuration.isNotBlank())
+                listOf(existing, "Previous estimate: $oldDuration minutes (choose dates to replace it).").filter { it.isNotBlank() }.joinToString("\n")
+            else existing
+        },
+        inventory = (optJSONArray("inventory") ?: JSONArray()).let { array -> (0 until array.length()).mapNotNull { array.optJSONObject(it)?.toInventoryItem() } },
         workers = people("workers"),
         photos = strings("photos"),
         importedSource = optString("importedSource")

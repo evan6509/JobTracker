@@ -1,5 +1,6 @@
 package com.evanchubbuck.jobtracker
 
+import android.app.DatePickerDialog
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -18,21 +19,26 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.util.Locale
+import java.util.Calendar
+import java.util.TimeZone
+import java.math.BigDecimal
 
-internal val UiInk = Color(0xFF18304A)
-internal val UiCanvas = Color(0xFFF6F8F7)
-private val muted = Color(0xFF687685)
-private val green = Color(0xFF177A5A)
-private val amber = Color(0xFFAD832C)
-private val steps = listOf("Clients", "Job site", "Schedule", "Work details", "Outside workers", "Photos", "Review")
+internal val UiInk: Color @Composable get() = MaterialTheme.colorScheme.onSurface
+internal val UiCanvas: Color @Composable get() = MaterialTheme.colorScheme.background
+private val muted: Color @Composable get() = MaterialTheme.colorScheme.onSurfaceVariant
+private val green: Color @Composable get() = MaterialTheme.colorScheme.primary
+private val amber: Color @Composable get() = Color(0xFFD5A84D)
+private val steps = listOf("Clients", "Job site", "Schedule", "Work details", "Inventory", "Outside workers", "Photos", "Review")
 
 @Composable
 private fun PageTitle(title: String, subtitle: String) {
@@ -96,7 +102,7 @@ internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, 
                                 else if (drag < -threshold && currentIndex > 0) { reorder(currentIndex, currentIndex - 1); drag = 0f }
                             }
                         }.clickable { onOpen(job.id) },
-                        colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
                         Column(Modifier.padding(18.dp)) {
                             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                                 Text(job.label, color = UiInk, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
@@ -105,7 +111,7 @@ internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, 
                             Spacer(Modifier.height(8.dp))
                             Text(job.state.uppercase(Locale.US), color = border, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
                             if (job.address.isNotBlank()) Text(job.address, color = muted, maxLines = 2)
-                            if (job.startDate.isNotBlank()) Text("${job.startDate}  ${job.startTime}", color = muted)
+                            if (job.startDate.isNotBlank()) Text(scheduleSummary(job), color = muted)
                             if (job.address.isBlank() && job.startDate.isBlank()) Text("Job #${job.id.take(6)}", color = muted)
                         }
                     }
@@ -133,7 +139,7 @@ internal fun HistoryScreen(jobs: List<Job>, modifier: Modifier, onOpen: (String)
 
 @Composable
 internal fun DetailScreen(job: Job, modifier: Modifier, onEdit: (Int) -> Unit, onNavigate: () -> Unit,
-    onCalendar: () -> Unit, onCall: (String) -> Unit, onPhoto: (String) -> Unit, onShare: () -> Unit,
+    onCalendar: () -> Unit, onCall: (String) -> Unit, onPhoto: (String) -> Unit, onShare: () -> Unit, onPdf: () -> Unit, onCosts: () -> Unit,
     onActivate: () -> Unit, onPlan: () -> Unit, onComplete: () -> Unit) {
     Column(modifier.verticalScroll(rememberScrollState()).padding(20.dp)) {
         Text(job.state.uppercase(Locale.US), color = if (job.state == Job.ACTIVE) green else muted, fontWeight = FontWeight.Bold)
@@ -144,6 +150,8 @@ internal fun DetailScreen(job: Job, modifier: Modifier, onEdit: (Int) -> Unit, o
             Job.COMPLETED -> OutlinedButton(onClick = onPlan) { Text("Restore to planned") }
         }
         OutlinedButton(onClick = onShare, modifier = Modifier.fillMaxWidth()) { Text("Share job · QR") }
+        OutlinedButton(onClick = onPdf, modifier = Modifier.fillMaxWidth()) { Text("Share job · PDF") }
+        OutlinedButton(onClick = onCosts, modifier = Modifier.fillMaxWidth()) { Text("Costs · private") }
         Spacer(Modifier.height(20.dp))
         DetailSection("Clients", 0, onEdit) {
             job.clients.forEach { person ->
@@ -153,16 +161,19 @@ internal fun DetailScreen(job: Job, modifier: Modifier, onEdit: (Int) -> Unit, o
         }
         DetailSection("Job site", 1, onEdit) {
             Text(job.address.ifBlank { "No address yet" }, color = UiInk)
-            if (job.address.isNotBlank()) TextButton(onClick = onNavigate) { Text("Navigate") }
+            if (job.address.isNotBlank()) OutlinedButton(onClick = onNavigate) { Text("Navigate") }
         }
         DetailSection("Schedule", 2, onEdit) {
-            Text(if (job.startDate.isBlank()) "Start not set" else "${job.startDate} at ${job.startTime}", color = UiInk)
-            Text(if (job.durationMinutes.isBlank()) "Estimate not set" else "Estimated ${job.durationMinutes} minutes", color = muted)
-            if (parseStart(job) != null && (job.durationMinutes.toLongOrNull() ?: 0) > 0) TextButton(onClick = onCalendar) { Text("Add to calendar") }
+            Text(scheduleSummary(job), color = UiInk)
+            if (calendarRange(job) != null) OutlinedButton(onClick = onCalendar) { Text("Add to calendar") }
             Text("Calendar events you already saved are not changed by edits.", color = muted, style = MaterialTheme.typography.bodySmall)
         }
         DetailSection("Work details", 3, onEdit) { Text(job.description.ifBlank { "No details yet" }, color = UiInk) }
-        DetailSection("Outside workers", 4, onEdit) {
+        DetailSection("Inventory", 4, onEdit) {
+            if (job.inventory.isEmpty()) Text("No items planned", color = muted)
+            job.inventory.filter { it.name.isNotBlank() }.forEach { item -> Text("${item.quantity.ifBlank { "1" }} × ${item.name}${if (item.notes.isBlank()) "" else " · ${item.notes}"}", color = UiInk) }
+        }
+        DetailSection("Outside workers", 5, onEdit) {
             if (job.workers.isEmpty()) Text("None added", color = muted)
             job.workers.forEach { worker ->
                 Text(worker.name.ifBlank { "Unnamed worker" }, color = UiInk, fontWeight = FontWeight.SemiBold)
@@ -170,7 +181,7 @@ internal fun DetailScreen(job: Job, modifier: Modifier, onEdit: (Int) -> Unit, o
                 if (worker.phone.isNotBlank()) TextButton(onClick = { onCall(worker.phone) }) { Text("Call ${worker.phone}") }
             }
         }
-        DetailSection("Photos", 5, onEdit) {
+        DetailSection("Photos", 6, onEdit) {
             if (job.photos.isEmpty()) Text("No reference photos", color = muted)
             job.photos.forEachIndexed { index, path ->
                 Row(Modifier.fillMaxWidth().clickable { onPhoto(path) }.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -185,7 +196,7 @@ internal fun DetailScreen(job: Job, modifier: Modifier, onEdit: (Int) -> Unit, o
 
 @Composable
 private fun DetailSection(title: String, step: Int, onEdit: (Int) -> Unit, content: @Composable () -> Unit) {
-    Card(Modifier.fillMaxWidth().padding(bottom = 12.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+    Card(Modifier.fillMaxWidth().padding(bottom = 12.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.padding(16.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(title, color = UiInk, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
@@ -218,10 +229,11 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
             PageTitle(steps[step], when (step) {
                 0 -> "Who is this job for? Add each client separately."
                 1 -> "Where will the work happen?"
-                2 -> "Set a time and estimate when you know them."
-                3 -> "Describe the work and what is needed."
-                4 -> "Assign work to any outside workers."
-                5 -> "Keep useful reference photos with this job."
+                2 -> "Choose the job dates. A start time is optional."
+                3 -> "Describe the work."
+                4 -> "List items the job will require, or skip for now."
+                5 -> "Assign work to any outside workers."
+                6 -> "Keep useful reference photos with this job."
                 else -> "Check the details before saving."
             })
             when (step) {
@@ -237,20 +249,37 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
                 }
                 1 -> {
                     Field("Street address", job.address, { onChange(job.copy(address = it)) }, singleLine = false)
-                    if (job.address.isNotBlank()) TextButton(onClick = onNavigate) { Text("Navigate") }
+                    if (job.address.isNotBlank()) OutlinedButton(onClick = onNavigate) { Text("Navigate") }
                 }
                 2 -> {
-                    Field("Start date · YYYY-MM-DD", job.startDate, { onChange(job.copy(startDate = it, timeZone = java.util.TimeZone.getDefault().id)) })
-                    Field("Start time · HH:MM (24 hour)", job.startTime, { onChange(job.copy(startTime = it, timeZone = java.util.TimeZone.getDefault().id)) })
-                    if (job.startDate.isNotBlank() != job.startTime.isNotBlank()) Text("Enter both date and time, or leave both blank.", color = MaterialTheme.colorScheme.error)
-                    else if (job.startDate.isNotBlank() && parseStart(job) == null) Text("Check the date and time format.", color = MaterialTheme.colorScheme.error)
-                    Field("Estimated duration · minutes", job.durationMinutes, { onChange(job.copy(durationMinutes = it)) }, keyboard = KeyboardType.Number)
-                    if (job.durationMinutes.isNotBlank() && (job.durationMinutes.toLongOrNull() ?: 0) <= 0) Text("Enter a number above zero.", color = MaterialTheme.colorScheme.error)
+                    DateField("Start date", job.startDate, job.timeZone, { onChange(job.copy(startDate = it, timeZone = TimeZone.getDefault().id)) })
+                    DateField("End date (optional)", job.endDate, job.timeZone, { onChange(job.copy(endDate = it, timeZone = TimeZone.getDefault().id)) })
+                    Field("Start time · HH:MM (optional)", job.startTime, { onChange(job.copy(startTime = it, timeZone = TimeZone.getDefault().id)) })
+                    if (job.startTime.isNotBlank() && parseStart(job) == null) Text("Choose a start date and use 24-hour time, such as 09:30.", color = MaterialTheme.colorScheme.error)
+                    if (job.startDate.isNotBlank() && job.endDate.isNotBlank() && (parseDate(job.endDate, job.timeZone) ?: 0) < (parseDate(job.startDate, job.timeZone) ?: 0)) Text("End date must be on or after start date.", color = MaterialTheme.colorScheme.error)
                     Text("Time zone: ${job.timeZone}", color = muted, style = MaterialTheme.typography.bodySmall)
-                    if (parseStart(job) != null && (job.durationMinutes.toLongOrNull() ?: 0) > 0) TextButton(onClick = onCalendar) { Text("Add to calendar") }
+                    if (calendarRange(job) != null) OutlinedButton(onClick = onCalendar) { Text("Add to calendar") }
                 }
-                3 -> Field("Work description and needed items", job.description, { onChange(job.copy(description = it)) }, singleLine = false, minLines = 6)
+                3 -> Field("Work description", job.description, { onChange(job.copy(description = it)) }, singleLine = false, minLines = 6)
                 4 -> {
+                    if (job.inventory.isEmpty()) Text("No inventory items decided yet.", color = muted)
+                    job.inventory.forEachIndexed { index, item ->
+                        OutlinedCard(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                            Column(Modifier.padding(12.dp)) {
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Item ${index + 1}", color = UiInk, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                                    TextButton(onClick = { onChange(job.copy(inventory = job.inventory.filterIndexed { i, _ -> i != index })) }) { Text("Remove") }
+                                }
+                                Field("Item name", item.name, { value -> onChange(job.copy(inventory = job.inventory.toMutableList().also { list -> list[index] = item.copy(name = value) })) })
+                                Field("Quantity", item.quantity, { value -> onChange(job.copy(inventory = job.inventory.toMutableList().also { list -> list[index] = item.copy(quantity = value) })) })
+                                Field("Notes (optional)", item.notes, { value -> onChange(job.copy(inventory = job.inventory.toMutableList().also { list -> list[index] = item.copy(notes = value) })) })
+                            }
+                        }
+                    }
+                    OutlinedButton(onClick = { onChange(job.copy(inventory = job.inventory + InventoryItem())) }) { Text("Add item") }
+                    if (job.inventory.isEmpty()) TextButton(onClick = { onStep(step + 1) }) { Text("Skip inventory for now") }
+                }
+                5 -> {
                     if (job.workers.isEmpty()) Text("No outside workers added.", color = muted)
                     job.workers.forEachIndexed { index, person ->
                         PersonEditor("Worker ${index + 1}", person, showWork = true,
@@ -259,7 +288,7 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
                     }
                     OutlinedButton(onClick = { onChange(job.copy(workers = job.workers + Person())) }) { Text("Add worker") }
                 }
-                5 -> {
+                6 -> {
                     Button(onClick = onPickPhotos) { Text("Add photos") }
                     Text("Photos stay on this device and are not included in QR sharing.", color = muted, style = MaterialTheme.typography.bodySmall)
                     job.photos.forEachIndexed { index, path ->
@@ -271,13 +300,14 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
                         }
                     }
                 }
-                6 -> {
+                7 -> {
                     ReviewLine("Clients", job.clients.filter { it.name.isNotBlank() }.joinToString { it.name }, 0, onStep)
                     ReviewLine("Job site", job.address, 1, onStep)
-                    ReviewLine("Schedule", listOf(job.startDate, job.startTime, job.durationMinutes.takeIf { it.isBlank() } ?: "${job.durationMinutes} min").filter { it.isNotBlank() }.joinToString(" · "), 2, onStep)
+                    ReviewLine("Schedule", scheduleSummary(job), 2, onStep)
                     ReviewLine("Work details", job.description, 3, onStep)
-                    ReviewLine("Outside workers", job.workers.joinToString { it.name }, 4, onStep)
-                    ReviewLine("Photos", "${job.photos.size} attached", 5, onStep)
+                    ReviewLine("Inventory", job.inventory.joinToString { "${it.quantity.ifBlank { "1" }} × ${it.name}" }, 4, onStep)
+                    ReviewLine("Outside workers", job.workers.joinToString { it.name }, 5, onStep)
+                    ReviewLine("Photos", "${job.photos.size} attached", 6, onStep)
                 }
             }
             if (error.isNotBlank()) { Spacer(Modifier.height(12.dp)); Text(error, color = MaterialTheme.colorScheme.error) }
@@ -290,6 +320,19 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
             }
         }
     }
+}
+
+@Composable
+private fun DateField(label: String, value: String, zone: String, onChange: (String) -> Unit) {
+    val context = LocalContext.current
+    val dark = MaterialTheme.colorScheme.background.luminance() < 0.5f
+    OutlinedButton(onClick = {
+        val selected = Calendar.getInstance(TimeZone.getTimeZone(zone)).apply { timeInMillis = parseDate(value, zone) ?: System.currentTimeMillis() }
+        DatePickerDialog(context, if (dark) android.R.style.Theme_Material_Dialog_Alert else android.R.style.Theme_Material_Light_Dialog_Alert,
+            { _, year, month, day -> onChange("%04d-%02d-%02d".format(Locale.US, year, month + 1, day)) },
+            selected.get(Calendar.YEAR), selected.get(Calendar.MONTH), selected.get(Calendar.DAY_OF_MONTH)).show()
+    }, modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp)) { Text("$label: ${if (value.isBlank()) "Choose date" else displayDate(value, zone)}") }
+    if (value.isNotBlank()) TextButton(onClick = { onChange("") }) { Text("Clear $label") }
 }
 
 @Composable
@@ -339,7 +382,36 @@ internal fun ShareScreen(job: Job, modifier: Modifier) {
         else Image(bitmap.asImageBitmap(), contentDescription = "Job QR code", modifier = Modifier.fillMaxWidth().height(300.dp))
         Spacer(Modifier.height(12.dp))
         Text("Offline · no internet or account needed", color = UiInk, fontWeight = FontWeight.Bold)
-        Text("Includes client contacts, address, schedule, description, and worker assignments. Photos are not included. Anyone who scans this code can read those details. The code does not expire or revoke; it is a snapshot and later edits will not update imported copies.", color = muted)
+        Text("Includes client contacts, address, schedule, description, inventory, and worker assignments. Photos and private costs are not included. Anyone who scans this code can read those details. The code does not expire or revoke; it is a snapshot and later edits will not update imported copies.", color = muted)
+    }
+}
+
+@Composable
+internal fun CostsScreen(job: Job, items: List<CostItem>, modifier: Modifier, onChange: (List<CostItem>) -> Unit, onExport: () -> Unit) {
+    val invalid = items.any { it.amount.isNotBlank() && (it.amount.toBigDecimalOrNull() ?: BigDecimal(-1)) < BigDecimal.ZERO }
+    val total = items.mapNotNull { it.amount.toBigDecimalOrNull() }.fold(BigDecimal.ZERO, BigDecimal::add)
+    Column(modifier.verticalScroll(rememberScrollState()).padding(20.dp)) {
+        PageTitle("Costs · ${job.label}", "Private to this job. Edit costs here and export them separately.")
+        Text("Costs are never included in job QR codes or job PDFs.", color = muted)
+        Spacer(Modifier.height(12.dp))
+        items.forEachIndexed { index, item ->
+            OutlinedCard(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                Column(Modifier.padding(12.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Cost ${index + 1}", color = UiInk, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { onChange(items.filterIndexed { i, _ -> i != index }) }) { Text("Remove") }
+                    }
+                    Field("Description", item.description, { onChange(items.toMutableList().also { list -> list[index] = item.copy(description = it) }) })
+                    Field("Amount", item.amount, { onChange(items.toMutableList().also { list -> list[index] = item.copy(amount = it) }) }, keyboard = KeyboardType.Decimal)
+                }
+            }
+        }
+        OutlinedButton(onClick = { onChange(items + CostItem()) }) { Text("Add cost") }
+        Spacer(Modifier.height(18.dp))
+        Text("Total: ${"%.2f".format(Locale.US, total)}", color = UiInk, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        if (invalid) Text("Amounts must be zero or greater before export.", color = MaterialTheme.colorScheme.error)
+        Spacer(Modifier.height(18.dp))
+        Button(onClick = onExport, enabled = !invalid, modifier = Modifier.fillMaxWidth()) { Text("Export costs PDF") }
     }
 }
 
@@ -351,10 +423,11 @@ internal fun PreviewScreen(job: Job, duplicate: Boolean, modifier: Modifier, onC
         Text(job.label, color = UiInk, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
         ReviewText("Clients", job.clients.joinToString { "${it.name}${if (it.phone.isBlank()) "" else " · ${it.phone}"}" })
         ReviewText("Address", job.address)
-        ReviewText("Schedule", "${job.startDate} ${job.startTime} · ${job.durationMinutes} min")
+        ReviewText("Schedule", scheduleSummary(job))
         ReviewText("Work details", job.description)
+        ReviewText("Inventory", job.inventory.filter { it.name.isNotBlank() }.joinToString { "${it.quantity.ifBlank { "1" }} × ${it.name}${if (it.notes.isBlank()) "" else " · ${it.notes}"}" })
         ReviewText("Outside workers", job.workers.joinToString { "${it.name}: ${it.work}${if (it.phone.isBlank()) "" else " · ${it.phone}"}" })
-        Text("Photos are not included. This will be a planned job and will not change your active job.", color = muted)
+        Text("Photos and private costs are not included. This will be a planned job and will not change your active job.", color = muted)
         Spacer(Modifier.height(18.dp))
         Button(onClick = onImport, modifier = Modifier.fillMaxWidth()) { Text(if (duplicate) "Import another copy" else "Import as planned") }
         OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) { Text("Cancel") }

@@ -15,7 +15,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.evanchubbuck.jobtracker.ui.theme.JobTrackerTheme
@@ -31,11 +30,17 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { JobTrackerTheme { JobTrackerApp() } }
+        setContent {
+            val prefs = remember { getSharedPreferences("job_tracker_settings", MODE_PRIVATE) }
+            var darkMode by remember { mutableStateOf(prefs.getBoolean("dark_mode", true)) }
+            JobTrackerTheme(darkTheme = darkMode) {
+                JobTrackerApp(darkMode) { enabled -> darkMode = enabled; prefs.edit().putBoolean("dark_mode", enabled).apply() }
+            }
+        }
     }
 
     @Composable
-    private fun JobTrackerApp() {
+    private fun JobTrackerApp(darkMode: Boolean, onDarkMode: (Boolean) -> Unit) {
         val store = remember { JobStore(this) }
         var jobs by remember { mutableStateOf(store.jobs()) }
         var draft by remember { mutableStateOf(store.draft()) }
@@ -50,6 +55,7 @@ class MainActivity : ComponentActivity() {
         var activateId by remember { mutableStateOf<String?>(null) }
         var completeId by remember { mutableStateOf<String?>(null) }
         var photoPath by remember { mutableStateOf<String?>(null) }
+        var costs by remember { mutableStateOf<List<CostItem>>(emptyList()) }
         var scanRaw by rememberSaveable { mutableStateOf("") }
         val scanPreview = remember(scanRaw) { runCatching { if (scanRaw.isBlank()) null else JSONObject(scanRaw).getJSONObject("job").toJob() }.getOrNull() }
         val scanSource = remember(scanRaw) { runCatching { JSONObject(scanRaw).getString("source") }.getOrDefault("") }
@@ -74,7 +80,7 @@ class MainActivity : ComponentActivity() {
         fun back() {
             when (screen) {
                 "editor" -> if (step > 0) { step--; if (editingId.isBlank()) store.saveDraftStep(step); error = "" } else { screen = if (editingId.isBlank()) "home" else "detail"; editor = null }
-                "share" -> screen = "detail"
+                "share", "costs" -> screen = "detail"
                 else -> screen = "home"
             }
         }
@@ -85,15 +91,29 @@ class MainActivity : ComponentActivity() {
             if (address.isNotBlank()) launch(Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=${Uri.encode(address)}")), "No map app is available.")
         }
         fun calendar(job: Job) {
-            val start = parseStart(job)
-            val minutes = job.durationMinutes.toLongOrNull()
-            if (start == null || minutes == null || minutes <= 0) { message = "Set a valid start date, time, and duration first."; return }
+            val range = calendarRange(job)
+            if (range == null) { message = "Choose a valid start date first."; return }
             launch(Intent(Intent.ACTION_INSERT).setData(CalendarContract.Events.CONTENT_URI)
                 .putExtra(CalendarContract.Events.TITLE, job.label)
                 .putExtra(CalendarContract.Events.EVENT_LOCATION, job.address)
                 .putExtra(CalendarContract.Events.DESCRIPTION, job.description)
-                .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, start)
-                .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, start + minutes * 60_000), "No calendar app is available.")
+                .putExtra(CalendarContract.EXTRA_EVENT_ALL_DAY, range.allDay)
+                .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, range.start)
+                .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, range.end), "No calendar app is available.")
+        }
+        fun exportPdf(job: Job, costExport: Boolean) {
+            try {
+                val file = if (costExport) createCostsPdf(this, job, costs) else createJobPdf(this, job)
+                val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "application/pdf"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_SUBJECT, if (costExport) "${job.label} costs" else job.label)
+                    clipData = android.content.ClipData.newUri(contentResolver, "JobTracker PDF", uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                launch(Intent.createChooser(intent, "Send PDF"), "No app is available to send the PDF.")
+            } catch (_: Exception) { message = "Could not create the PDF. Try again." }
         }
         val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
             val current = editor
@@ -121,15 +141,20 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) { message = "This is not a valid JobTracker QR code." }
             }
         }
-        fun scan() { scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Scan a JobTracker job QR code").setBeepEnabled(false).setOrientationLocked(false)) }
+        fun scan() { scanner.launch(ScanOptions().setCaptureActivity(JobScannerActivity::class.java).setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Scan a JobTracker job QR code").setBeepEnabled(false).setOrientationLocked(false)) }
 
         BackHandler(screen != "home") { back() }
         Scaffold(containerColor = UiCanvas, topBar = {
             Surface(color = UiInk) {
-                Row(Modifier.fillMaxWidth().padding(12.dp)) {
-                    if (screen != "home") TextButton(onClick = { back() }) { Text("‹ Back", color = Color.White) }
+                Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    if (screen != "home") TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }
                     Spacer(Modifier.weight(1f))
-                    Text("JOBTRACKER", Modifier.padding(12.dp), color = Color.White, fontWeight = FontWeight.Bold)
+                    if (screen == "home") {
+                        Text(if (darkMode) "Dark mode" else "Light mode", color = UiCanvas)
+                        Switch(checked = darkMode, onCheckedChange = onDarkMode)
+                    } else if (screen == "detail") {
+                        TextButton(onClick = { screen = "home" }) { Text("Home", color = UiCanvas) }
+                    }
                 }
             }
         }) { padding ->
@@ -144,7 +169,8 @@ class MainActivity : ComponentActivity() {
                 "detail" -> jobs.firstOrNull { it.id == selectedId }?.let { job ->
                     DetailScreen(job, area, onEdit = { openEditor(job.id, it) }, onNavigate = { navigate(job.address) },
                         onCalendar = { calendar(job) }, onCall = { phone -> launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")), "No phone app is available.") },
-                        onPhoto = { photoPath = it }, onShare = { screen = "share" },
+                        onPhoto = { photoPath = it }, onShare = { screen = "share" }, onPdf = { exportPdf(job, false) },
+                        onCosts = { costs = store.costs(job.id); screen = "costs" },
                         onActivate = { if (jobs.any { it.state == Job.ACTIVE && it.id != job.id }) activateId = job.id else setState(job.id, Job.ACTIVE) },
                         onPlan = { setState(job.id, Job.PLANNED) }, onComplete = { completeId = job.id })
                 }
@@ -164,13 +190,15 @@ class MainActivity : ComponentActivity() {
                                 error = problem
                                 step = when {
                                     current.clients.none { it.name.isNotBlank() } || current.clients.any { !validPhone(it.phone) || (it.name.isBlank() && it.phone.isNotBlank()) } -> 0
-                                    current.workers.any { !validPhone(it.phone) || (it.name.isBlank() && (it.phone.isNotBlank() || it.work.isNotBlank())) || (it.name.isNotBlank() && it.work.isBlank()) } -> 4
+                                    current.workers.any { !validPhone(it.phone) || (it.name.isBlank() && (it.phone.isNotBlank() || it.work.isNotBlank())) || (it.name.isNotBlank() && it.work.isBlank()) } -> 5
+                                    current.inventory.any { it.name.isBlank() && (it.quantity.isNotBlank() || it.notes.isNotBlank()) } -> 4
                                     else -> 2
                                 }
                                 if (editingId.isBlank()) store.saveDraftStep(step)
                             } else if (editingId.isBlank()) {
                                 val saved = current.copy(clients = current.clients.filter { it.name.isNotBlank() },
                                     workers = current.workers.filter { it.name.isNotBlank() || it.phone.isNotBlank() || it.work.isNotBlank() },
+                                    inventory = current.inventory.filter { it.name.isNotBlank() },
                                     priority = (jobs.maxOfOrNull { it.priority } ?: -1) + 1, updatedAt = System.currentTimeMillis())
                                 val hadActive = jobs.any { it.state == Job.ACTIVE }
                                 persist(jobs + saved); draft = null; store.saveDraft(null); editor = null
@@ -180,6 +208,8 @@ class MainActivity : ComponentActivity() {
                         })
                 }
                 "share" -> jobs.firstOrNull { it.id == selectedId }?.let { ShareScreen(it, area) }
+                "costs" -> jobs.firstOrNull { it.id == selectedId }?.let { job -> CostsScreen(job, costs, area,
+                    onChange = { costs = it; store.saveCosts(job.id, it) }, onExport = { exportPdf(job, true) }) }
                 "preview" -> scanPreview?.let { incoming -> PreviewScreen(incoming, jobs.any { it.importedSource == scanSource }, area,
                     onCancel = { scanRaw = ""; screen = "home" }, onImport = {
                         val now = System.currentTimeMillis()
