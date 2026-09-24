@@ -1,47 +1,220 @@
 package com.evanchubbuck.jobtracker
 
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.provider.CalendarContract
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import com.evanchubbuck.jobtracker.ui.theme.JobTrackerTheme
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import org.json.JSONObject
+import java.io.File
+import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
-        setContent {
-            JobTrackerTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    Greeting(
-                        name = "Android",
-                        modifier = Modifier.padding(innerPadding)
-                    )
+        setContent { JobTrackerTheme { JobTrackerApp() } }
+    }
+
+    @Composable
+    private fun JobTrackerApp() {
+        val store = remember { JobStore(this) }
+        var jobs by remember { mutableStateOf(store.jobs()) }
+        var draft by remember { mutableStateOf(store.draft()) }
+        var screen by rememberSaveable { mutableStateOf("home") }
+        var selectedId by rememberSaveable { mutableStateOf("") }
+        var editingId by rememberSaveable { mutableStateOf("") }
+        var editor by remember { mutableStateOf<Job?>(null) }
+        var step by rememberSaveable { mutableIntStateOf(0) }
+        var error by remember { mutableStateOf("") }
+        var message by remember { mutableStateOf("") }
+        var replaceDraft by remember { mutableStateOf(false) }
+        var activateId by remember { mutableStateOf<String?>(null) }
+        var completeId by remember { mutableStateOf<String?>(null) }
+        var photoPath by remember { mutableStateOf<String?>(null) }
+        var scanRaw by rememberSaveable { mutableStateOf("") }
+        val scanPreview = remember(scanRaw) { runCatching { if (scanRaw.isBlank()) null else JSONObject(scanRaw).getJSONObject("job").toJob() }.getOrNull() }
+        val scanSource = remember(scanRaw) { runCatching { JSONObject(scanRaw).getString("source") }.getOrDefault("") }
+        val scope = rememberCoroutineScope()
+
+        fun persist(list: List<Job>) { jobs = list; store.saveJobs(list) }
+        fun changeEditor(value: Job) {
+            editor = value
+            if (editingId.isBlank()) { draft = value; store.saveDraft(value) }
+            else persist(jobs.map { if (it.id == editingId) value.copy(updatedAt = System.currentTimeMillis()) else it })
+        }
+        fun openEditor(id: String = "", section: Int = 0) {
+            editingId = id
+            editor = if (id.isBlank()) draft ?: Job() else jobs.firstOrNull { it.id == id }
+            if (id.isBlank()) editor?.let { draft = it; store.saveDraft(it) }
+            step = if (id.isBlank() && draft != null) store.draftStep() else section
+            error = ""; screen = "editor"
+        }
+        fun setState(id: String, state: String) {
+            persist(changeJobState(jobs, id, state))
+        }
+        fun back() {
+            when (screen) {
+                "editor" -> if (step > 0) { step--; if (editingId.isBlank()) store.saveDraftStep(step); error = "" } else { screen = if (editingId.isBlank()) "home" else "detail"; editor = null }
+                "share" -> screen = "detail"
+                else -> screen = "home"
+            }
+        }
+        fun launch(intent: Intent, failure: String) {
+            try { startActivity(intent) } catch (_: ActivityNotFoundException) { message = failure }
+        }
+        fun navigate(address: String) {
+            if (address.isNotBlank()) launch(Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=${Uri.encode(address)}")), "No map app is available.")
+        }
+        fun calendar(job: Job) {
+            val start = parseStart(job)
+            val minutes = job.durationMinutes.toLongOrNull()
+            if (start == null || minutes == null || minutes <= 0) { message = "Set a valid start date, time, and duration first."; return }
+            launch(Intent(Intent.ACTION_INSERT).setData(CalendarContract.Events.CONTENT_URI)
+                .putExtra(CalendarContract.Events.TITLE, job.label)
+                .putExtra(CalendarContract.Events.EVENT_LOCATION, job.address)
+                .putExtra(CalendarContract.Events.DESCRIPTION, job.description)
+                .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, start)
+                .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, start + minutes * 60_000), "No calendar app is available.")
+        }
+        val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+            val current = editor
+            if (current != null && uris.isNotEmpty()) {
+                val editSession = editingId
+                scope.launch {
+                    val paths = withContext(Dispatchers.IO) { uris.mapNotNull { copyPhoto(this@MainActivity, it) } }
+                    val latest = editor
+                    if (latest?.id == current.id && editingId == editSession) changeEditor(latest.copy(photos = latest.photos + paths))
+                    else paths.forEach { File(it).delete() }
+                    if (paths.size != uris.size) message = "Some photos could not be added."
                 }
             }
         }
-    }
-}
+        val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
+            if (result.contents != null) {
+                try {
+                    val data = JSONObject(result.contents)
+                    require(data.optString("format") == "jobtracker-v1")
+                    val imported = data.getJSONObject("job").toJob()
+                    require(imported.clients.any { it.name.isNotBlank() })
+                    require(data.getString("source").isNotBlank())
+                    scanRaw = result.contents
+                    screen = "preview"
+                } catch (_: Exception) { message = "This is not a valid JobTracker QR code." }
+            }
+        }
+        fun scan() { scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Scan a JobTracker job QR code").setBeepEnabled(false).setOrientationLocked(false)) }
 
-@Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
-    Text(
-        text = "Hello $name!",
-        modifier = modifier
-    )
-}
+        BackHandler(screen != "home") { back() }
+        Scaffold(containerColor = UiCanvas, topBar = {
+            Surface(color = UiInk) {
+                Row(Modifier.fillMaxWidth().padding(12.dp)) {
+                    if (screen != "home") TextButton(onClick = { back() }) { Text("‹ Back", color = Color.White) }
+                    Spacer(Modifier.weight(1f))
+                    Text("JOBTRACKER", Modifier.padding(12.dp), color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            }
+        }) { padding ->
+            val area = Modifier.fillMaxSize().padding(padding)
+            when (screen) {
+                "home" -> HomeScreen(jobs, draft != null, area, onNew = { if (draft == null) openEditor() else replaceDraft = true }, onResume = { openEditor() },
+                    onOpen = { selectedId = it; screen = "detail" }, onHistory = { screen = "history" }, onScan = { scan() },
+                    onReorder = { from, to ->
+                        persist(reorderVisibleJobs(jobs, from, to))
+                    })
+                "history" -> HistoryScreen(jobs.filter { it.state == Job.COMPLETED }, area) { selectedId = it; screen = "detail" }
+                "detail" -> jobs.firstOrNull { it.id == selectedId }?.let { job ->
+                    DetailScreen(job, area, onEdit = { openEditor(job.id, it) }, onNavigate = { navigate(job.address) },
+                        onCalendar = { calendar(job) }, onCall = { phone -> launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")), "No phone app is available.") },
+                        onPhoto = { photoPath = it }, onShare = { screen = "share" },
+                        onActivate = { if (jobs.any { it.state == Job.ACTIVE && it.id != job.id }) activateId = job.id else setState(job.id, Job.ACTIVE) },
+                        onPlan = { setState(job.id, Job.PLANNED) }, onComplete = { completeId = job.id })
+                }
+                "editor" -> {
+                    val current = editor ?: if (editingId.isBlank()) draft ?: Job() else jobs.firstOrNull { it.id == editingId }
+                    if (current != null) EditorScreen(current, step, editingId.isNotBlank(), error, area,
+                        onChange = { changeEditor(it); error = "" }, onStep = { step = it; if (editingId.isBlank()) store.saveDraftStep(step); error = "" }, onBack = { back() },
+                        onExit = { editor = null; screen = if (editingId.isBlank()) "home" else "detail" },
+                        onPickPhotos = { picker.launch("image/*") }, onPhoto = { photoPath = it },
+                        onRemovePhoto = { path ->
+                            changeEditor(current.copy(photos = current.photos - path))
+                            if (path.startsWith(File(filesDir, "photos").canonicalPath + File.separator)) File(path).delete()
+                        }, onNavigate = { navigate(current.address) }, onCalendar = { calendar(current) },
+                        onFinish = {
+                            val problem = validationError(current)
+                            if (problem != null) {
+                                error = problem
+                                step = when {
+                                    current.clients.none { it.name.isNotBlank() } || current.clients.any { !validPhone(it.phone) || (it.name.isBlank() && it.phone.isNotBlank()) } -> 0
+                                    current.workers.any { !validPhone(it.phone) || (it.name.isBlank() && (it.phone.isNotBlank() || it.work.isNotBlank())) || (it.name.isNotBlank() && it.work.isBlank()) } -> 4
+                                    else -> 2
+                                }
+                                if (editingId.isBlank()) store.saveDraftStep(step)
+                            } else if (editingId.isBlank()) {
+                                val saved = current.copy(clients = current.clients.filter { it.name.isNotBlank() },
+                                    workers = current.workers.filter { it.name.isNotBlank() || it.phone.isNotBlank() || it.work.isNotBlank() },
+                                    priority = (jobs.maxOfOrNull { it.priority } ?: -1) + 1, updatedAt = System.currentTimeMillis())
+                                val hadActive = jobs.any { it.state == Job.ACTIVE }
+                                persist(jobs + saved); draft = null; store.saveDraft(null); editor = null
+                                selectedId = saved.id; screen = "detail"
+                                if (!hadActive) activateId = saved.id
+                            } else { editor = null; selectedId = editingId; screen = "detail" }
+                        })
+                }
+                "share" -> jobs.firstOrNull { it.id == selectedId }?.let { ShareScreen(it, area) }
+                "preview" -> scanPreview?.let { incoming -> PreviewScreen(incoming, jobs.any { it.importedSource == scanSource }, area,
+                    onCancel = { scanRaw = ""; screen = "home" }, onImport = {
+                        val now = System.currentTimeMillis()
+                        val copy = incoming.copy(id = UUID.randomUUID().toString(), state = Job.PLANNED,
+                            priority = (jobs.maxOfOrNull { it.priority } ?: -1) + 1, createdAt = now, updatedAt = now,
+                            photos = emptyList(), importedSource = scanSource)
+                        persist(jobs + copy); scanRaw = ""; selectedId = copy.id; screen = "detail"
+                    }) }
+            }
+        }
 
-@Preview(showBackground = true)
-@Composable
-fun GreetingPreview() {
-    JobTrackerTheme {
-        Greeting("Android")
+        activateId?.let { id ->
+            val previous = jobs.firstOrNull { it.state == Job.ACTIVE && it.id != id }
+            AlertDialog(onDismissRequest = { activateId = null }, title = { Text(if (previous == null) "Activate this job now?" else "Make this the active job?") },
+                text = { Text(if (previous == null) "You can keep it planned and activate it later." else "${previous.label} will move back to planned. Only one job can be active.") },
+                confirmButton = { TextButton(onClick = { setState(id, Job.ACTIVE); activateId = null }) { Text("Activate") } },
+                dismissButton = { TextButton(onClick = { activateId = null }) { Text(if (previous == null) "Keep planned" else "Cancel") } })
+        }
+        if (replaceDraft) AlertDialog(onDismissRequest = { replaceDraft = false },
+            title = { Text("Start a different job?") },
+            text = { Text("This will discard the unfinished draft. You can resume it instead from Home.") },
+            confirmButton = { TextButton(onClick = {
+                val photoFolder = File(filesDir, "photos").canonicalPath + File.separator
+                draft?.photos?.filter { it.startsWith(photoFolder) }?.forEach { File(it).delete() }
+                draft = null; store.saveDraft(null); replaceDraft = false; openEditor()
+            }) { Text("Discard draft") } },
+            dismissButton = { TextButton(onClick = { replaceDraft = false }) { Text("Cancel") } })
+        completeId?.let { id -> AlertDialog(onDismissRequest = { completeId = null }, title = { Text("Mark job completed?") },
+            text = { Text("It will move to History and can be restored later.") },
+            confirmButton = { TextButton(onClick = { setState(id, Job.COMPLETED); completeId = null; screen = "home" }) { Text("Complete") } },
+            dismissButton = { TextButton(onClick = { completeId = null }) { Text("Cancel") } }) }
+        photoPath?.let { path -> AlertDialog(onDismissRequest = { photoPath = null },
+            text = { PhotoImage(path, Modifier.fillMaxWidth().height(350.dp)) },
+            confirmButton = { TextButton(onClick = { photoPath = null }) { Text("Close") } }) }
+        if (message.isNotBlank()) AlertDialog(onDismissRequest = { message = "" }, title = { Text("JobTracker") },
+            text = { Text(message) }, confirmButton = { TextButton(onClick = { message = "" }) { Text("OK") } })
     }
 }
