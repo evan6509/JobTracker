@@ -6,9 +6,9 @@ An offline Android app for organizing current, planned, and completed jobs. The 
 
 Open this directory in Android Studio, or run `./gradlew :app:assembleDebug`. The debug APK is at `app/build/outputs/apk/debug/app-debug.apk` and can be installed on an Android 7.0+ device.
 
-GitHub Actions builds, tests, and lints every push and pull request. Download the `JobTracker-debug-apk` artifact from a successful run to install that build. Pushing a version tag such as `v1.1.1` also creates a GitHub Release with the APK attached.
+GitHub Actions builds, tests, and lints every push and pull request. Download the `JobTracker-debug-apk` artifact from a successful `main` push to install that build. Pushing a version tag such as `v1.1.1` also creates a GitHub Release with the APK attached. Pull requests do not publish installable artifacts.
 
-These APKs are debug-signed. The project does not yet have a separate release signing key, so install this build as a personal/test app and keep its signing identity for future updates.
+The `main` and tagged APKs use the same debug signing key as the local build, so they can update the installed app. The key is stored as a GitHub Actions secret and is unavailable to pull requests. Keep a backup of the signing key; a different key cannot update existing installs.
 
 ## Job sharing
 
