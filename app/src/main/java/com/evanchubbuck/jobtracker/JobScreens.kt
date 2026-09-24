@@ -49,7 +49,7 @@ private fun PageTitle(title: String, subtitle: String) {
 
 @Composable
 internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, onNew: () -> Unit, onResume: () -> Unit,
-    onOpen: (String) -> Unit, onHistory: () -> Unit, onScan: () -> Unit, onCheckUpdate: () -> Unit,
+    onOpen: (String) -> Unit, onHistory: () -> Unit, onScan: () -> Unit, onSync: () -> Unit, onCheckUpdate: () -> Unit,
     onReorder: (Int, Int) -> Unit) {
     val visible = jobs.filter { it.state != Job.COMPLETED }.sortedBy { it.priority }
     Column(modifier.padding(20.dp)) {
@@ -73,7 +73,7 @@ internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, 
         if (visible.isEmpty()) {
             Spacer(Modifier.weight(1f))
             Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("no jobs planned", color = Color.Gray, style = MaterialTheme.typography.titleLarge)
+                Text("No jobs planned", color = Color.Gray, style = MaterialTheme.typography.titleLarge)
                 Spacer(Modifier.height(10.dp))
                 Button(onClick = onNew) { Text("New Job") }
             }
@@ -120,7 +120,42 @@ internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, 
             }
         }
         OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) { Text("Scan job QR") }
+        OutlinedButton(onClick = onSync, modifier = Modifier.fillMaxWidth()) { Text("Sync phones") }
         TextButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) { Text("Check for updates") }
+    }
+}
+
+@Composable
+internal fun SyncScreen(sync: WifiDirectSync, permissionGranted: Boolean, onPermission: () -> Unit, modifier: Modifier) {
+    Column(modifier.verticalScroll(rememberScrollState()).padding(20.dp)) {
+        PageTitle("Sync phones", "Keep both phones nearby with this screen open. No internet or account is needed.")
+        Text("Both phones exchange saved jobs, photos, private costs, and an unfinished draft. A newer edit to the same job wins. If each phone has a different unfinished draft, each keeps its own draft.", color = muted)
+        Spacer(Modifier.height(16.dp))
+        if (!permissionGranted) {
+            Text("Allow nearby and local network access to connect the phones. On older Android versions, this uses Location permission.", color = UiInk)
+            Button(onClick = onPermission, modifier = Modifier.fillMaxWidth()) { Text("Allow nearby access") }
+        } else {
+            Text(sync.status, color = UiInk)
+            Spacer(Modifier.height(12.dp))
+            if (sync.code != null) {
+                Text(sync.code.orEmpty(), color = UiInk, style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold)
+                Text("Confirm only if this code matches on the other phone.", color = muted)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { sync.confirm(true) }) { Text("Codes match") }
+                    OutlinedButton(onClick = { sync.confirm(false) }) { Text("Cancel") }
+                }
+            } else if (sync.result == null && !sync.busy) {
+                OutlinedButton(onClick = sync::discover, modifier = Modifier.fillMaxWidth()) { Text("Search again") }
+                Spacer(Modifier.height(8.dp))
+                Text("Nearby phones", color = UiInk, fontWeight = FontWeight.Bold)
+                if (sync.peers.isEmpty()) Text("No phones found yet. Open Sync phones on the other phone, turn on Wi-Fi and Location, then search again.", color = muted)
+                sync.peers.forEach { peer ->
+                    OutlinedButton(onClick = { sync.connect(peer) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(peer.deviceName.ifBlank { "Nearby phone" })
+                    }
+                }
+            }
+        }
     }
 }
 

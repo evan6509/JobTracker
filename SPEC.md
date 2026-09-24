@@ -19,7 +19,7 @@ Creating a job does not automatically make it active. After setup, if no job is 
 
 ### 1. Home
 
-When there are no active or planned jobs, show gray text reading exactly **“no jobs planned”** and a **“New Job”** button directly below it. Completed jobs do not prevent this empty state. A **Scan job QR** action is available from Home, including the empty state.
+When there are no active or planned jobs, show gray text reading exactly **“No jobs planned”** and a **“New Job”** button directly below it. Completed jobs do not prevent this empty state. A **Scan job QR** action is available from Home, including the empty state.
 
 When jobs exist, display a series of cards from the top to the bottom of the screen, allowing for scrolling if there are many. Each card shows a short job identifier (such as the client name or job title), the job state, and sufficient schedule/location information to distinguish similar jobs. The active job has a green border. Planned jobs have a gray or muted yellow border; the final color choice is part of the visual design. The state must also be displayed in text to ensure it is understandable without relying on color. A ****“New Job”**** action remains available.
 
@@ -54,6 +54,12 @@ The job detail screen has a **Share job** action that generates a scannable QR c
 
 The shared information includes the job's clients, address, schedule, description, inventory, and outside-worker assignments. Photos and costs are excluded from QR codes. QR sharing works offline; anyone who scans the code can read the snapshot, which does not expire. A separate job PDF includes job details, inventory, and reference photos for sending through Android's share sheet. It excludes costs. Later edits do not update an imported copy or an already exported PDF.
 
+### 5. Sync phones over Wi-Fi Direct
+
+Both Android phones open **Sync phones** while near each other. One selects the other from the nearby-device list. Each phone shows a matching code, and both users confirm before any job data is sent. No internet, account, router, or hosted server is needed. Each phone sends its saved jobs, reference photo files, private costs, and unfinished draft. QR sharing remains a separate one-time import.
+
+Jobs with the same ID are merged using the newer edit time. If edit times tie, the same deterministic comparison runs on both phones. At most one job remains active. A different unfinished draft on each phone stays on its original phone and is reported after sync. A sync does not update previously exported PDFs or calendar events. The phones must be together with this screen open; this is not automatic remote synchronization.
+
 ## Data to retain per job
 
 - Stable job ID; short display title; state; priority position; creation and update timestamps.
@@ -70,7 +76,7 @@ Job data and photo references must remain available after the app restarts. Remo
 
 ## Acceptance criteria
 
-1. With no active/planned jobs, Home displays **“no jobs planned”** in gray and **“New Job”** immediately below it.
+1. With no active/planned jobs, Home displays **“No jobs planned”** in gray and **“New Job”** immediately below it.
 2. **New Job** opens the steps in the order above. Backward navigation retains entries; finishing creates one planned or active job according to the activation choice.
 3. Finishing the first job offers activation. Finishing another job while one is active leaves the new job planned. The app never shows two active jobs.
 4. Active and planned jobs have distinct borders and readable text labels. Tapping a job opens its full details.

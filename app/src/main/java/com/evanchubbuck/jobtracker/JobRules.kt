@@ -15,5 +15,9 @@ internal fun reorderVisibleJobs(jobs: List<Job>, from: Int, to: Int): List<Job> 
     if (from !in visible.indices || to !in visible.indices) return jobs
     visible.add(to, visible.removeAt(from))
     val ranks = visible.mapIndexed { index, job -> job.id to index }.toMap()
-    return jobs.map { it.copy(priority = ranks[it.id] ?: it.priority) }
+    val now = System.currentTimeMillis()
+    return jobs.map { job ->
+        val rank = ranks[job.id] ?: job.priority
+        if (rank == job.priority) job else job.copy(priority = rank, updatedAt = now)
+    }
 }

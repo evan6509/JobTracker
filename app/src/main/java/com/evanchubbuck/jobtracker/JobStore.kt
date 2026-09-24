@@ -50,9 +50,15 @@ class JobStore(context: Context) {
         (0 until array.length()).mapNotNull { array.optJSONObject(it)?.let { row -> CostItem(row.optString("description"), row.optString("amount")) } }
     }.getOrDefault(emptyList())
 
+    fun costsUpdatedAt(jobId: String): Long = prefs.getLong("costs_updated_$jobId", 0L)
+
     fun saveCosts(jobId: String, items: List<CostItem>) {
+        saveCostsAt(jobId, items, System.currentTimeMillis())
+    }
+
+    fun saveCostsAt(jobId: String, items: List<CostItem>, updatedAt: Long) {
         val array = JSONArray().apply { items.forEach { put(JSONObject().put("description", it.description).put("amount", it.amount)) } }
-        prefs.edit().putString("costs_$jobId", array.toString()).apply()
+        prefs.edit().putString("costs_$jobId", array.toString()).putLong("costs_updated_$jobId", updatedAt).apply()
     }
 
     fun saveDraft(job: Job?) {

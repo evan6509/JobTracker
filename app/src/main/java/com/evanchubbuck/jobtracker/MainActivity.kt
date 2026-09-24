@@ -2,6 +2,9 @@ package com.evanchubbuck.jobtracker
 
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.Manifest
+import android.os.Build
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
@@ -18,9 +21,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
+import androidx.core.content.ContextCompat
 import com.evanchubbuck.jobtracker.ui.theme.JobTrackerTheme
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -59,6 +66,15 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun JobTrackerApp(darkMode: Boolean, onDarkMode: (Boolean) -> Unit) {
         val store = remember { JobStore(this) }
+        val sync = remember { WifiDirectSync(this, store) }
+        val nearbyPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.NEARBY_WIFI_DEVICES else Manifest.permission.ACCESS_FINE_LOCATION
+        var nearbyAllowed by remember { mutableStateOf(ContextCompat.checkSelfPermission(this, nearbyPermission) == PackageManager.PERMISSION_GRANTED) }
+        var networkAllowed by remember { mutableStateOf(Build.VERSION.SDK_INT < 37 ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_LOCAL_NETWORK) == PackageManager.PERMISSION_GRANTED) }
+        val nearbyRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+            nearbyAllowed = grants[nearbyPermission] == true
+            if (Build.VERSION.SDK_INT >= 37) networkAllowed = grants[Manifest.permission.ACCESS_LOCAL_NETWORK] == true
+        }
         var jobs by remember { mutableStateOf(store.jobs()) }
         var draft by remember { mutableStateOf(store.draft()) }
         var screen by rememberSaveable { mutableStateOf("home") }
@@ -80,10 +96,22 @@ class MainActivity : ComponentActivity() {
         val scanSource = remember(scanRaw) { runCatching { JSONObject(scanRaw).getString("source") }.getOrDefault("") }
         val scope = rememberCoroutineScope()
 
+        DisposableEffect(screen, nearbyAllowed, networkAllowed) {
+            if (screen == "sync" && nearbyAllowed && networkAllowed) sync.start()
+            onDispose { if (screen == "sync") sync.stop() }
+        }
+        LaunchedEffect(sync.result) {
+            if (sync.result != null) {
+                jobs = store.jobs()
+                draft = store.draft()
+                costs = store.costs(selectedId)
+            }
+        }
+
         fun persist(list: List<Job>) { jobs = list; store.saveJobs(list) }
         fun changeEditor(value: Job) {
             editor = value
-            if (editingId.isBlank()) { draft = value; store.saveDraft(value) }
+            if (editingId.isBlank()) { val changed = value.copy(updatedAt = System.currentTimeMillis()); draft = changed; editor = changed; store.saveDraft(changed) }
             else persist(jobs.map { if (it.id == editingId) value.copy(updatedAt = System.currentTimeMillis()) else it })
         }
         fun openEditor(id: String = "", section: Int = 0) {
@@ -98,7 +126,7 @@ class MainActivity : ComponentActivity() {
         }
         fun back() {
             when (screen) {
-                "editor" -> if (step > 0) { step--; if (editingId.isBlank()) store.saveDraftStep(step); error = "" } else { screen = if (editingId.isBlank()) "home" else "detail"; editor = null }
+                "editor" -> if (step > 0) { step--; if (editingId.isBlank()) { store.saveDraftStep(step); draft?.let(::changeEditor) }; error = "" } else { screen = if (editingId.isBlank()) "home" else "detail"; editor = null }
                 "share", "costs" -> screen = "detail"
                 else -> screen = "home"
             }
@@ -182,8 +210,9 @@ class MainActivity : ComponentActivity() {
                     if (screen != "home") TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }
                     Spacer(Modifier.weight(1f))
                     if (screen == "home") {
-                        Text(if (darkMode) "Dark mode" else "Light mode", color = UiCanvas)
-                        Switch(checked = darkMode, onCheckedChange = onDarkMode)
+                        Text(if (darkMode) "🌙" else "☀️", fontSize = 24.sp)
+                        Switch(checked = darkMode, onCheckedChange = onDarkMode,
+                            modifier = Modifier.semantics { contentDescription = "Dark mode" })
                     } else if (screen == "detail") {
                         TextButton(onClick = { screen = "home" }) { Text("Home", color = UiCanvas) }
                     }
@@ -194,11 +223,19 @@ class MainActivity : ComponentActivity() {
             when (screen) {
                 "home" -> HomeScreen(jobs, draft != null, area, onNew = { if (draft == null) openEditor() else replaceDraft = true }, onResume = { openEditor() },
                     onOpen = { selectedId = it; screen = "detail" }, onHistory = { screen = "history" }, onScan = { scan() },
+                    onSync = { screen = "sync" },
                     onCheckUpdate = { checkForUpdate() },
                     onReorder = { from, to ->
                         persist(reorderVisibleJobs(jobs, from, to))
                     })
                 "history" -> HistoryScreen(jobs.filter { it.state == Job.COMPLETED }, area) { selectedId = it; screen = "detail" }
+                "sync" -> SyncScreen(sync, nearbyAllowed && networkAllowed, {
+                    nearbyRequest.launch(if (Build.VERSION.SDK_INT in 31..32)
+                        arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
+                    else if (Build.VERSION.SDK_INT >= 37)
+                        arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES, Manifest.permission.ACCESS_LOCAL_NETWORK)
+                    else arrayOf(nearbyPermission))
+                }, area)
                 "detail" -> jobs.firstOrNull { it.id == selectedId }?.let { job ->
                     DetailScreen(job, area, onEdit = { openEditor(job.id, it) }, onNavigate = { navigate(job.address) },
                         onCalendar = { calendar(job) }, onCall = { phone -> launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")), "No phone app is available.") },
@@ -210,7 +247,7 @@ class MainActivity : ComponentActivity() {
                 "editor" -> {
                     val current = editor ?: if (editingId.isBlank()) draft ?: Job() else jobs.firstOrNull { it.id == editingId }
                     if (current != null) EditorScreen(current, step, editingId.isNotBlank(), error, area,
-                        onChange = { changeEditor(it); error = "" }, onStep = { step = it; if (editingId.isBlank()) store.saveDraftStep(step); error = "" }, onBack = { back() },
+                        onChange = { changeEditor(it); error = "" }, onStep = { step = it; if (editingId.isBlank()) { store.saveDraftStep(step); draft?.let(::changeEditor) }; error = "" }, onBack = { back() },
                         onExit = { editor = null; screen = if (editingId.isBlank()) "home" else "detail" },
                         onPickPhotos = { picker.launch("image/*") }, onPhoto = { photoPath = it },
                         onRemovePhoto = { path ->
