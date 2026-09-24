@@ -3,6 +3,7 @@ package com.evanchubbuck.jobtracker
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.Manifest
+import android.app.ActivityManager
 import android.os.Build
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -16,11 +17,14 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -66,6 +70,9 @@ class MainActivity : ComponentActivity() {
     private fun JobTrackerApp(darkMode: Boolean, onDarkMode: (Boolean) -> Unit) {
         val store = remember { JobStore(this) }
         val sync = remember { WifiDirectSync(this, store) }
+        val installedVersion = remember {
+            runCatching { packageManager.getPackageInfo(packageName, 0).versionName.orEmpty() }.getOrDefault("")
+        }
         val nearbyPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.NEARBY_WIFI_DEVICES else Manifest.permission.ACCESS_FINE_LOCATION
         var nearbyAllowed by remember { mutableStateOf(ContextCompat.checkSelfPermission(this, nearbyPermission) == PackageManager.PERMISSION_GRANTED) }
         var networkAllowed by remember { mutableStateOf(Build.VERSION.SDK_INT < 37 ||
@@ -84,6 +91,9 @@ class MainActivity : ComponentActivity() {
         var error by remember { mutableStateOf("") }
         var message by remember { mutableStateOf("") }
         var replaceDraft by remember { mutableStateOf(false) }
+        var deleteDraft by remember { mutableStateOf(false) }
+        var clearAllData by remember { mutableStateOf(false) }
+        var menuExpanded by remember { mutableStateOf(false) }
         var activateId by remember { mutableStateOf<String?>(null) }
         var completeId by remember { mutableStateOf<String?>(null) }
         var photoPath by remember { mutableStateOf<String?>(null) }
@@ -108,6 +118,15 @@ class MainActivity : ComponentActivity() {
         }
 
         fun persist(list: List<Job>) { jobs = list; store.saveJobs(list) }
+        fun discardDraft() {
+            val photoFolder = File(filesDir, "photos").canonicalPath + File.separator
+            val usedPhotos = jobs.flatMap { it.photos }.toSet()
+            draft?.photos?.filter { path ->
+                path !in usedPhotos && runCatching { File(path).canonicalPath.startsWith(photoFolder) }.getOrDefault(false)
+            }?.forEach { File(it).delete() }
+            draft = null
+            store.saveDraft(null)
+        }
         fun changeEditor(value: Job) {
             editor = value
             if (editingId.isBlank()) { val changed = value.copy(updatedAt = System.currentTimeMillis()); draft = changed; editor = changed; store.saveDraft(changed) }
@@ -205,14 +224,41 @@ class MainActivity : ComponentActivity() {
         BackHandler(screen != "home") { back() }
         Scaffold(containerColor = UiCanvas, topBar = {
             Surface(color = UiInk) {
-                Row(Modifier.fillMaxWidth().statusBarsPadding().padding(12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                    if (screen != "home") TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }
-                    Spacer(Modifier.weight(1f))
+                Row(Modifier.fillMaxWidth().statusBarsPadding().height(52.dp).padding(horizontal = 12.dp),
+                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                     if (screen == "home") {
-                        Text(if (darkMode) "Dark mode" else "Light mode", color = UiCanvas)
-                        Switch(checked = darkMode, onCheckedChange = onDarkMode,
-                            modifier = Modifier.semantics { contentDescription = "Dark mode" })
-                    } else if (screen == "detail") {
+                        Box {
+                            val menuColor = UiCanvas
+                            IconButton(onClick = { menuExpanded = true },
+                                modifier = Modifier.semantics { contentDescription = "Open menu" }) {
+                                Canvas(Modifier.size(22.dp)) {
+                                    for (fraction in listOf(0.22f, 0.5f, 0.78f)) {
+                                        val y = size.height * fraction
+                                        drawLine(menuColor, Offset(0f, y), Offset(size.width, y),
+                                            strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+                                    }
+                                }
+                            }
+                            DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                                DropdownMenuItem(text = { Text("Settings") }, onClick = {
+                                    menuExpanded = false; screen = "settings"
+                                })
+                                DropdownMenuItem(text = { Text("Check for updates") }, onClick = {
+                                    menuExpanded = false; checkForUpdate()
+                                })
+                                HorizontalDivider()
+                                DropdownMenuItem(text = { Text("Clear all data", color = MaterialTheme.colorScheme.error) }, onClick = {
+                                    menuExpanded = false; clearAllData = true
+                                })
+                            }
+                        }
+                        Text("JobTracker", color = UiCanvas, style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 8.dp))
+                    } else {
+                        TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }
+                    }
+                    Spacer(Modifier.weight(1f))
+                    if (screen == "detail") {
                         TextButton(onClick = { screen = "home" }) { Text("Home", color = UiCanvas) }
                     }
                 }
@@ -223,10 +269,10 @@ class MainActivity : ComponentActivity() {
                 "home" -> HomeScreen(jobs, draft != null, area, onNew = { if (draft == null) openEditor() else replaceDraft = true }, onResume = { openEditor() },
                     onOpen = { selectedId = it; screen = "detail" }, onHistory = { screen = "history" }, onScan = { scan() },
                     onSync = { screen = "sync" },
-                    onCheckUpdate = { checkForUpdate() },
                     onReorder = { from, to ->
                         persist(reorderVisibleJobs(jobs, from, to))
-                    })
+                    }, onDeleteDraft = { deleteDraft = true })
+                "settings" -> SettingsScreen(darkMode, onDarkMode, installedVersion, area)
                 "history" -> HistoryScreen(jobs.filter { it.state == Job.COMPLETED }, area) { selectedId = it; screen = "detail" }
                 "sync" -> SyncScreen(sync, nearbyAllowed && networkAllowed, {
                     nearbyRequest.launch(if (Build.VERSION.SDK_INT in 31..32)
@@ -301,11 +347,25 @@ class MainActivity : ComponentActivity() {
             title = { Text("Start a different job?") },
             text = { Text("This will discard the unfinished draft. You can resume it instead from Home.") },
             confirmButton = { TextButton(onClick = {
-                val photoFolder = File(filesDir, "photos").canonicalPath + File.separator
-                draft?.photos?.filter { it.startsWith(photoFolder) }?.forEach { File(it).delete() }
-                draft = null; store.saveDraft(null); replaceDraft = false; openEditor()
+                discardDraft(); replaceDraft = false; openEditor()
             }) { Text("Discard draft") } },
             dismissButton = { TextButton(onClick = { replaceDraft = false }) { Text("Cancel") } })
+        if (deleteDraft) AlertDialog(onDismissRequest = { deleteDraft = false },
+            title = { Text("Delete unfinished job?") },
+            text = { Text("Your saved setup and photos stored only with this draft will be deleted.") },
+            confirmButton = { TextButton(onClick = { discardDraft(); deleteDraft = false }) { Text("Delete") } },
+            dismissButton = { TextButton(onClick = { deleteDraft = false }) { Text("Cancel") } })
+        if (clearAllData) AlertDialog(onDismissRequest = { clearAllData = false },
+            title = { Text("Clear all JobTracker data?") },
+            text = { Text("This erases all jobs, drafts, photos saved in JobTracker, private costs, settings, and app permissions on this phone. Copies exported elsewhere remain. The app will close.") },
+            confirmButton = { TextButton(onClick = {
+                clearAllData = false
+                val cleared = runCatching {
+                    (getSystemService(ACTIVITY_SERVICE) as ActivityManager).clearApplicationUserData()
+                }.getOrDefault(false)
+                if (!cleared) message = "Could not clear app data. Try again from Android Settings."
+            }) { Text("Clear all data") } },
+            dismissButton = { TextButton(onClick = { clearAllData = false }) { Text("Cancel") } })
         completeId?.let { id -> AlertDialog(onDismissRequest = { completeId = null }, title = { Text("Mark job completed?") },
             text = { Text("It will move to History and can be restored later.") },
             confirmButton = { TextButton(onClick = { setState(id, Job.COMPLETED); completeId = null; screen = "home" }) { Text("Complete") } },
@@ -316,7 +376,6 @@ class MainActivity : ComponentActivity() {
         if (checkingUpdate) AlertDialog(onDismissRequest = {}, title = { Text("Checking GitHub") },
             text = { CircularProgressIndicator() }, confirmButton = {})
         latestRelease?.let { release ->
-            val installedVersion = packageManager.getPackageInfo(packageName, 0).versionName.orEmpty()
             val newer = isNewerRelease(release.tag, installedVersion)
             AlertDialog(onDismissRequest = { latestRelease = null },
                 title = { Text(if (newer) "Update available" else "JobTracker is up to date") },

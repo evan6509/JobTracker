@@ -49,8 +49,8 @@ private fun PageTitle(title: String, subtitle: String) {
 
 @Composable
 internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, onNew: () -> Unit, onResume: () -> Unit,
-    onOpen: (String) -> Unit, onHistory: () -> Unit, onScan: () -> Unit, onSync: () -> Unit, onCheckUpdate: () -> Unit,
-    onReorder: (Int, Int) -> Unit) {
+    onOpen: (String) -> Unit, onHistory: () -> Unit, onScan: () -> Unit, onSync: () -> Unit,
+    onReorder: (Int, Int) -> Unit, onDeleteDraft: () -> Unit) {
     val visible = jobs.filter { it.state != Job.COMPLETED }.sortedBy { it.priority }
     Column(modifier.padding(20.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -62,10 +62,29 @@ internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, 
         }
         Spacer(Modifier.height(18.dp))
         if (hasDraft) {
-            OutlinedCard(Modifier.fillMaxWidth().clickable(onClick = onResume)) {
-                Column(Modifier.padding(16.dp)) {
-                    Text("Continue unfinished job", fontWeight = FontWeight.SemiBold, color = UiInk)
-                    Text("Your setup is saved", color = muted)
+            val dismissState = rememberSwipeToDismissBoxState(confirmValueChange = { value ->
+                if (value == SwipeToDismissBoxValue.EndToStart) onDeleteDraft()
+                false
+            })
+            SwipeToDismissBox(
+                state = dismissState,
+                enableDismissFromStartToEnd = false,
+                backgroundContent = {
+                    Box(
+                        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.errorContainer, RoundedCornerShape(16.dp))
+                            .padding(horizontal = 24.dp),
+                        contentAlignment = Alignment.CenterEnd
+                    ) {
+                        Text("Delete draft", color = MaterialTheme.colorScheme.onErrorContainer, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            ) {
+                OutlinedCard(Modifier.fillMaxWidth().clickable(onClick = onResume)) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("Continue unfinished job", fontWeight = FontWeight.SemiBold, color = UiInk)
+                        Text("Your setup is saved", color = muted)
+                        Text("Swipe left to delete", color = muted, style = MaterialTheme.typography.labelSmall)
+                    }
                 }
             }
             Spacer(Modifier.height(14.dp))
@@ -121,7 +140,32 @@ internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, 
         }
         OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) { Text("Scan job QR") }
         OutlinedButton(onClick = onSync, modifier = Modifier.fillMaxWidth()) { Text("Sync phones") }
-        TextButton(onClick = onCheckUpdate, modifier = Modifier.fillMaxWidth()) { Text("Check for updates") }
+    }
+}
+
+@Composable
+internal fun SettingsScreen(darkMode: Boolean, onDarkMode: (Boolean) -> Unit, version: String, modifier: Modifier) {
+    Column(modifier.padding(20.dp)) {
+        PageTitle("Settings", "")
+        Text("Appearance", color = muted, style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(8.dp))
+        OutlinedCard(Modifier.fillMaxWidth()) {
+            Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Dark mode", color = UiInk, style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                Switch(checked = darkMode, onCheckedChange = onDarkMode)
+            }
+        }
+        Spacer(Modifier.height(20.dp))
+        Text("About", color = muted, style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(8.dp))
+        OutlinedCard(Modifier.fillMaxWidth()) {
+            Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("App version", color = UiInk, style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f))
+                Text(version.ifBlank { "Unavailable" }, color = muted)
+            }
+        }
     }
 }
 
