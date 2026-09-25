@@ -6,7 +6,7 @@ An offline Android app for organizing current, planned, and completed jobs. The 
 
 Open this directory in Android Studio, or run `./gradlew :app:assembleDebug`. The debug APK is at `app/build/outputs/apk/debug/app-debug.apk` and can be installed on an Android 7.0+ device.
 
-GitHub Actions builds, tests, and lints every push and pull request. On a successful `main` push, it reads `versionName` from `app/build.gradle.kts` and automatically creates a GitHub Release and version tag with the APK if that version has not been released yet. Later pushes with the same version do not create another release. Bump both `versionName` and `versionCode` for a new installable version. Pushing a matching version tag also publishes a release if it is missing. Pull requests do not publish installable artifacts.
+GitHub Actions builds, tests, and lints every push and pull request. On a successful `main` push, it reads `versionName` from `app/build.gradle.kts` and automatically creates a GitHub Release and version tag with the APK if that version has not been released yet. Later pushes with the same version do not create another release. For each new version, bump both `versionName` and `versionCode` and add a plain-language summary at `release-notes/vX.Y.Z.md`; the workflow publishes that summary as the release description and fails if it is missing. Pushing a matching version tag also publishes a release if it is missing. Pull requests do not publish installable artifacts.
 
 The `main` and tagged APKs use the same debug signing key as the local build, so they can update the installed app. The key is stored as a GitHub Actions secret and is unavailable to pull requests. Keep a backup of the signing key; a different key cannot update existing installs.
 
