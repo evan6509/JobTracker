@@ -42,6 +42,7 @@ import com.journeyapps.barcodescanner.ScanOptions
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -218,8 +219,10 @@ class MainActivity : ComponentActivity() {
             scope.launch {
                 try {
                     latestRelease = fetchLatestRelease()
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
-                    message = e.message ?: "Could not check GitHub for updates. Check your connection and try again."
+                    message = updateCheckErrorMessage(e)
                 } finally {
                     checkingUpdate = false
                 }
@@ -385,7 +388,7 @@ class MainActivity : ComponentActivity() {
         photoPath?.let { path -> AlertDialog(onDismissRequest = { photoPath = null },
             text = { PhotoImage(path, Modifier.fillMaxWidth().height(350.dp)) },
             confirmButton = { TextButton(onClick = { photoPath = null }) { Text("Close") } }) }
-        if (checkingUpdate) AlertDialog(onDismissRequest = {}, title = { Text("Checking GitHub") },
+        if (checkingUpdate) AlertDialog(onDismissRequest = {}, title = { Text("Checking for updates") },
             text = { CircularProgressIndicator() }, confirmButton = {})
         latestRelease?.let { release ->
             val newer = isNewerRelease(release.tag, installedVersion)
@@ -399,8 +402,8 @@ class MainActivity : ComponentActivity() {
                             try {
                                 downloadRelease(this@MainActivity, release)
                                 message = "Downloading ${release.tag}. Tap its notification when the download finishes to install it. Allow installs from JobTracker if Android asks."
-                            } catch (e: Exception) {
-                                message = e.message ?: "Could not start the download."
+                            } catch (_: Exception) {
+                                message = "Couldn't start the update download. Please try again."
                             }
                         }
                         latestRelease = null
