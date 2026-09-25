@@ -18,11 +18,16 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.semantics.contentDescription
@@ -229,8 +234,15 @@ class MainActivity : ComponentActivity() {
                     if (screen == "home") {
                         Box {
                             val menuColor = UiCanvas
-                            IconButton(onClick = { menuExpanded = true },
-                                modifier = Modifier.semantics { contentDescription = "Open menu" }) {
+                            val menuInteraction = remember { MutableInteractionSource() }
+                            Box(
+                                modifier = Modifier.size(48.dp).clip(CircleShape)
+                                    .clickable(interactionSource = menuInteraction,
+                                        indication = ripple(color = menuColor),
+                                        onClick = { menuExpanded = true })
+                                    .semantics { contentDescription = "Open menu" },
+                                contentAlignment = Alignment.Center
+                            ) {
                                 Canvas(Modifier.size(22.dp)) {
                                     for (fraction in listOf(0.22f, 0.5f, 0.78f)) {
                                         val y = size.height * fraction
@@ -252,7 +264,7 @@ class MainActivity : ComponentActivity() {
                                 })
                             }
                         }
-                        Text("JobTracker", color = UiCanvas, style = MaterialTheme.typography.titleMedium,
+                        Text("Job Tracker", color = UiCanvas, style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 8.dp))
                     } else {
                         TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }
