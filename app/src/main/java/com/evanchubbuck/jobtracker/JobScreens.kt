@@ -295,6 +295,7 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
     onChange: (Job) -> Unit, onStep: (Int) -> Unit, onBack: () -> Unit, onExit: () -> Unit, onPickPhotos: () -> Unit,
     onPhoto: (String) -> Unit, onRemovePhoto: (String) -> Unit, onNavigate: () -> Unit,
     onCalendar: () -> Unit, onFinish: () -> Unit) {
+    var showMissingClientName by remember(job.id) { mutableStateOf(false) }
     Column(modifier.padding(20.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(if (existing) "EDIT JOB" else "NEW JOB", color = green, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
@@ -322,11 +323,11 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
                     Field("Short job title (optional)", job.title, { onChange(job.copy(title = it)) })
                     job.clients.forEachIndexed { index, person ->
                         PersonEditor("Client ${index + 1}", person, showWork = false,
+                            showEmptyNameError = showMissingClientName && index == 0 && job.clients.none { it.name.isNotBlank() },
                             onChange = { changed -> onChange(job.copy(clients = job.clients.toMutableList().also { it[index] = changed })) },
                             onRemove = if (job.clients.size > 1) ({ onChange(job.copy(clients = job.clients.filterIndexed { i, _ -> i != index })) }) else null)
                     }
                     OutlinedButton(onClick = { onChange(job.copy(clients = job.clients + Person())) }) { Text("Add client") }
-                    if (job.clients.none { it.name.isNotBlank() }) Text("At least one client name is required to finish.", color = amber)
                 }
                 1 -> {
                     Field("Street address", job.address, { onChange(job.copy(address = it)) }, singleLine = false)
@@ -396,7 +397,13 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = onBack, modifier = Modifier.weight(1f)) { Text("Back") }
-            Button(onClick = if (step == steps.lastIndex) onFinish else ({ onStep(step + 1) }), modifier = Modifier.weight(1f)) {
+            Button(onClick = {
+                when {
+                    step == steps.lastIndex -> onFinish()
+                    step == 0 && job.clients.none { it.name.isNotBlank() } -> showMissingClientName = true
+                    else -> onStep(step + 1)
+                }
+            }, modifier = Modifier.weight(1f)) {
                 Text(if (step == steps.lastIndex) if (existing) "Done" else "Finish setup" else "Next")
             }
         }
@@ -424,7 +431,8 @@ private fun Field(label: String, value: String, onValueChange: (String) -> Unit,
 }
 
 @Composable
-private fun PersonEditor(title: String, person: Person, showWork: Boolean, onChange: (Person) -> Unit, onRemove: (() -> Unit)?) {
+private fun PersonEditor(title: String, person: Person, showWork: Boolean, showEmptyNameError: Boolean = false,
+    onChange: (Person) -> Unit, onRemove: (() -> Unit)?) {
     OutlinedCard(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
         Column(Modifier.padding(12.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -432,7 +440,7 @@ private fun PersonEditor(title: String, person: Person, showWork: Boolean, onCha
                 if (onRemove != null) TextButton(onClick = onRemove) { Text("Remove") }
             }
             Field("Name", person.name, { onChange(person.copy(name = it)) })
-            if (person.name.isBlank() && (!showWork || person.phone.isNotBlank() || person.work.isNotBlank())) Text("Name required for this entry.", color = MaterialTheme.colorScheme.error)
+            if (person.name.isBlank() && (showEmptyNameError || person.phone.isNotBlank() || (showWork && person.work.isNotBlank()))) Text("Name required for this entry.", color = MaterialTheme.colorScheme.error)
             Field("Phone (optional)", person.phone, { onChange(person.copy(phone = it)) }, keyboard = KeyboardType.Phone)
             if (person.phone.isNotBlank() && !validPhone(person.phone)) Text("Enter a callable phone number (3–15 digits).", color = MaterialTheme.colorScheme.error)
             if (showWork) {
