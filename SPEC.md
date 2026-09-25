@@ -46,7 +46,7 @@ The app should allow saving a useful job even if schedule, workers, and photos a
 
 ### 3. Job details
 
-Opening a job shows its clients and phone numbers, address, schedule, work description, inventory, assigned outside workers, and reference photos. The screen provides actions to edit each section, call a saved number, open the address in maps, add the job to a calendar, change active/planned state, mark the job completed, and share the job. A Home button appears at the top right. Returning to Home preserves the current priority order.
+Opening a job shows its clients and phone numbers, address, schedule, work description, inventory, assigned outside workers, and reference photos. The screen provides actions to edit each section, call a saved number, open the address in maps, add the job to a calendar, change active/planned state, mark the job completed, and share the job. On Home, swiping a planned or active job card left offers deletion after confirmation, including its private costs and photos stored only with that job. A Home button appears at the top right. Returning to Home preserves the current priority order.
 
 Editing a job's dates updates the saved job immediately. A calendar event that the user already saved is not silently changed by editing the job; the app offers **Add to calendar** again with the revised information. Completed jobs remain accessible in a separate history/list and can be reopened or restored to planned. A per-job Costs screen stores cost entries separately and has its own PDF export. Costs do not appear in job QR codes or job PDFs.
 

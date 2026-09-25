@@ -104,7 +104,12 @@ class MainActivity : ComponentActivity() {
         var menuExpanded by remember { mutableStateOf(false) }
         var activateId by remember { mutableStateOf<String?>(null) }
         var completeId by remember { mutableStateOf<String?>(null) }
+        var deleteJobId by remember { mutableStateOf<String?>(null) }
         var photoPath by remember { mutableStateOf<String?>(null) }
+        var pdfPath by rememberSaveable { mutableStateOf("") }
+        var pdfSubject by rememberSaveable { mutableStateOf("") }
+        var pdfReturnScreen by rememberSaveable { mutableStateOf("detail") }
+        var creatingPdf by remember { mutableStateOf(false) }
         var costs by remember { mutableStateOf<List<CostItem>>(emptyList()) }
         var scanRaw by rememberSaveable { mutableStateOf("") }
         var checkingUpdate by remember { mutableStateOf(false) }
@@ -126,14 +131,26 @@ class MainActivity : ComponentActivity() {
         }
 
         fun persist(list: List<Job>) { jobs = list; store.saveJobs(list) }
-        fun discardDraft() {
+        fun deleteUnusedPhotos(paths: List<String>, usedPhotos: Set<String>) {
             val photoFolder = File(filesDir, "photos").canonicalPath + File.separator
-            val usedPhotos = jobs.flatMap { it.photos }.toSet()
-            draft?.photos?.filter { path ->
+            paths.filter { path ->
                 path !in usedPhotos && runCatching { File(path).canonicalPath.startsWith(photoFolder) }.getOrDefault(false)
-            }?.forEach { File(it).delete() }
+            }.forEach { File(it).delete() }
+        }
+        fun discardDraft() {
+            draft?.photos?.let { deleteUnusedPhotos(it, jobs.flatMap { job -> job.photos }.toSet()) }
             draft = null
             store.saveDraft(null)
+        }
+        fun deleteSavedJob(id: String) {
+            val job = jobs.firstOrNull { it.id == id && it.state != Job.COMPLETED } ?: return
+            val remaining = jobs.filterNot { it.id == id }
+            persist(remaining)
+            store.deleteCosts(id)
+            val usedPhotos = remaining.flatMap { it.photos }.toSet() + (draft?.photos ?: emptyList())
+            deleteUnusedPhotos(job.photos, usedPhotos)
+            selectedId = ""
+            screen = "home"
         }
         fun changeEditor(value: Job) {
             editor = value
@@ -154,6 +171,7 @@ class MainActivity : ComponentActivity() {
             when (screen) {
                 "editor" -> if (step > 0) { step--; if (editingId.isBlank()) { store.saveDraftStep(step); draft?.let(::changeEditor) }; error = "" } else { screen = if (editingId.isBlank()) "home" else "detail"; editor = null }
                 "share", "costs" -> screen = "detail"
+                "pdf" -> { screen = pdfReturnScreen; pdfPath = ""; pdfSubject = "" }
                 else -> screen = "home"
             }
         }
@@ -174,19 +192,40 @@ class MainActivity : ComponentActivity() {
                 .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, range.start)
                 .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, range.end), "No calendar app is available.")
         }
-        fun exportPdf(job: Job, costExport: Boolean) {
+        fun sharePdf(file: File, subject: String) {
             try {
-                val file = if (costExport) createCostsPdf(this, job, costs) else createJobPdf(this, job)
                 val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
                 val intent = Intent(Intent.ACTION_SEND).apply {
                     type = "application/pdf"
                     putExtra(Intent.EXTRA_STREAM, uri)
-                    putExtra(Intent.EXTRA_SUBJECT, if (costExport) "${job.label} costs" else job.label)
+                    putExtra(Intent.EXTRA_SUBJECT, subject)
                     clipData = android.content.ClipData.newUri(contentResolver, "JobTracker PDF", uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
                 launch(Intent.createChooser(intent, "Send PDF"), "No app is available to send the PDF.")
-            } catch (_: Exception) { message = "Could not create the PDF. Try again." }
+            } catch (_: Exception) { message = "Could not share the PDF. Try again." }
+        }
+        fun previewPdf(job: Job, costExport: Boolean) {
+            if (creatingPdf) return
+            val returnScreen = screen
+            val exportCosts = costs
+            creatingPdf = true
+            scope.launch {
+                try {
+                    val file = withContext(Dispatchers.IO) {
+                        if (costExport) createCostsPdf(this@MainActivity, job, exportCosts) else createJobPdf(this@MainActivity, job)
+                    }
+                    if (screen == returnScreen && selectedId == job.id) {
+                        pdfPath = file.absolutePath
+                        pdfSubject = if (costExport) "${job.label} costs" else job.label
+                        pdfReturnScreen = returnScreen
+                        screen = "pdf"
+                    } else file.delete()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) { message = "Could not create the PDF. Try again." }
+                finally { creatingPdf = false }
+            }
         }
         val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
             val current = editor
@@ -286,7 +325,7 @@ class MainActivity : ComponentActivity() {
                     onSync = { screen = "sync" },
                     onReorder = { from, to ->
                         persist(reorderVisibleJobs(jobs, from, to))
-                    }, onDeleteDraft = { deleteDraft = true })
+                    }, onDeleteDraft = { deleteDraft = true }, onDeleteJob = { deleteJobId = it })
                 "settings" -> SettingsScreen(darkMode, onDarkMode, installedVersion, area)
                 "history" -> HistoryScreen(jobs.filter { it.state == Job.COMPLETED }, area) { selectedId = it; screen = "detail" }
                 "sync" -> SyncScreen(sync, nearbyAllowed && networkAllowed, {
@@ -299,7 +338,7 @@ class MainActivity : ComponentActivity() {
                 "detail" -> jobs.firstOrNull { it.id == selectedId }?.let { job ->
                     DetailScreen(job, area, onEdit = { openEditor(job.id, it) }, onNavigate = { navigate(job.address) },
                         onCalendar = { calendar(job) }, onCall = { phone -> launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")), "No phone app is available.") },
-                        onPhoto = { photoPath = it }, onShare = { screen = "share" }, onPdf = { exportPdf(job, false) },
+                        onPhoto = { photoPath = it }, onShare = { screen = "share" }, onPdf = { previewPdf(job, false) },
                         onCosts = { costs = store.costs(job.id); screen = "costs" },
                         onActivate = { if (jobs.any { it.state == Job.ACTIVE && it.id != job.id }) activateId = job.id else setState(job.id, Job.ACTIVE) },
                         onPlan = { setState(job.id, Job.PLANNED) }, onComplete = { completeId = job.id })
@@ -339,7 +378,8 @@ class MainActivity : ComponentActivity() {
                 }
                 "share" -> jobs.firstOrNull { it.id == selectedId }?.let { ShareScreen(it, area) }
                 "costs" -> jobs.firstOrNull { it.id == selectedId }?.let { job -> CostsScreen(job, costs, area,
-                    onChange = { costs = it; store.saveCosts(job.id, it) }, onExport = { exportPdf(job, true) }) }
+                    onChange = { costs = it; store.saveCosts(job.id, it) }, onExport = { previewPdf(job, true) }) }
+                "pdf" -> PdfPreviewScreen(File(pdfPath), pdfSubject, area, onShare = { sharePdf(File(pdfPath), pdfSubject) })
                 "preview" -> scanPreview?.let { incoming -> PreviewScreen(incoming, jobs.any { it.importedSource == scanSource }, area,
                     onCancel = { scanRaw = ""; screen = "home" }, onImport = {
                         val now = System.currentTimeMillis()
@@ -385,10 +425,17 @@ class MainActivity : ComponentActivity() {
             text = { Text("It will move to History and can be restored later.") },
             confirmButton = { TextButton(onClick = { setState(id, Job.COMPLETED); completeId = null; screen = "home" }) { Text("Complete") } },
             dismissButton = { TextButton(onClick = { completeId = null }) { Text("Cancel") } }) }
+        deleteJobId?.let { id -> AlertDialog(onDismissRequest = { deleteJobId = null },
+            title = { Text("Delete ${jobs.firstOrNull { it.id == id }?.label ?: "job"}?") },
+            text = { Text("This permanently deletes the job, its private costs, and photos stored only with this job. This cannot be undone.") },
+            confirmButton = { TextButton(onClick = { deleteSavedJob(id); deleteJobId = null }) { Text("Delete", color = MaterialTheme.colorScheme.error) } },
+            dismissButton = { TextButton(onClick = { deleteJobId = null }) { Text("Cancel") } }) }
         photoPath?.let { path -> AlertDialog(onDismissRequest = { photoPath = null },
             text = { PhotoImage(path, Modifier.fillMaxWidth().height(350.dp)) },
             confirmButton = { TextButton(onClick = { photoPath = null }) { Text("Close") } }) }
         if (checkingUpdate) AlertDialog(onDismissRequest = {}, title = { Text("Checking for updates") },
+            text = { CircularProgressIndicator() }, confirmButton = {})
+        if (creatingPdf) AlertDialog(onDismissRequest = {}, title = { Text("Creating PDF preview") },
             text = { CircularProgressIndicator() }, confirmButton = {})
         latestRelease?.let { release ->
             val newer = isNewerRelease(release.tag, installedVersion)

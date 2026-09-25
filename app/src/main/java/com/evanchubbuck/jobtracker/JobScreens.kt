@@ -50,13 +50,13 @@ private fun PageTitle(title: String, subtitle: String) {
 @Composable
 internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, onNew: () -> Unit, onResume: () -> Unit,
     onOpen: (String) -> Unit, onHistory: () -> Unit, onScan: () -> Unit, onSync: () -> Unit,
-    onReorder: (Int, Int) -> Unit, onDeleteDraft: () -> Unit) {
+    onReorder: (Int, Int) -> Unit, onDeleteDraft: () -> Unit, onDeleteJob: (String) -> Unit) {
     val visible = jobs.filter { it.state != Job.COMPLETED }.sortedBy { it.priority }
     Column(modifier.padding(20.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("Your jobs", color = UiInk, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
-                Text("${visible.size} in your lineup", color = muted)
+                Text("Your Jobs", color = UiInk, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+                Text("${visible.size} ${if (visible.size == 1) "job" else "jobs"} in progress", color = muted)
             }
             TextButton(onClick = onHistory) { Text("History") }
         }
@@ -99,7 +99,8 @@ internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, 
             Spacer(Modifier.weight(1f))
         } else {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("Priority order · hold and drag", color = muted, style = MaterialTheme.typography.labelMedium)
+                Text("Hold to reorder\nSwipe left to delete", color = muted,
+                    style = MaterialTheme.typography.labelMedium, modifier = Modifier.weight(1f))
                 Button(onClick = onNew) { Text("New Job") }
             }
             Spacer(Modifier.height(12.dp))
@@ -111,28 +112,46 @@ internal fun HomeScreen(jobs: List<Job>, hasDraft: Boolean, modifier: Modifier, 
                     val currentLast by rememberUpdatedState(visible.lastIndex)
                     val reorder by rememberUpdatedState(onReorder)
                     val border = if (job.state == Job.ACTIVE) green else amber
-                    Card(Modifier.fillMaxWidth().border(2.dp, border, RoundedCornerShape(16.dp))
-                        .graphicsLayer { translationY = drag }
-                        .pointerInput(job.id) {
-                            detectDragGesturesAfterLongPress(onDragEnd = { drag = 0f }, onDragCancel = { drag = 0f }) { change, amount ->
-                                change.consume()
-                                drag += amount.y
-                                val threshold = 90.dp.toPx()
-                                if (drag > threshold && currentIndex < currentLast) { reorder(currentIndex, currentIndex + 1); drag = 0f }
-                                else if (drag < -threshold && currentIndex > 0) { reorder(currentIndex, currentIndex - 1); drag = 0f }
+                    val dismissState = rememberSwipeToDismissBoxState(confirmValueChange = { value ->
+                        if (value == SwipeToDismissBoxValue.EndToStart) onDeleteJob(job.id)
+                        false
+                    })
+                    SwipeToDismissBox(
+                        state = dismissState,
+                        enableDismissFromStartToEnd = false,
+                        backgroundContent = {
+                            Box(
+                                Modifier.fillMaxSize().background(MaterialTheme.colorScheme.errorContainer, RoundedCornerShape(16.dp))
+                                    .padding(horizontal = 24.dp),
+                                contentAlignment = Alignment.CenterEnd
+                            ) {
+                                Text("Delete job", color = MaterialTheme.colorScheme.onErrorContainer, fontWeight = FontWeight.SemiBold)
                             }
-                        }.clickable { onOpen(job.id) },
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-                        Column(Modifier.padding(18.dp)) {
-                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                Text(job.label, color = UiInk, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                                Text("≡", color = muted, fontSize = 24.sp)
+                        }
+                    ) {
+                        Card(Modifier.fillMaxWidth().border(2.dp, border, RoundedCornerShape(16.dp))
+                            .graphicsLayer { translationY = drag }
+                            .pointerInput(job.id) {
+                                detectDragGesturesAfterLongPress(onDragEnd = { drag = 0f }, onDragCancel = { drag = 0f }) { change, amount ->
+                                    change.consume()
+                                    drag += amount.y
+                                    val threshold = 90.dp.toPx()
+                                    if (drag > threshold && currentIndex < currentLast) { reorder(currentIndex, currentIndex + 1); drag = 0f }
+                                    else if (drag < -threshold && currentIndex > 0) { reorder(currentIndex, currentIndex - 1); drag = 0f }
+                                }
+                            }.clickable { onOpen(job.id) },
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                            Column(Modifier.padding(18.dp)) {
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                    Text(job.label, color = UiInk, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                                    Text("≡", color = muted, fontSize = 24.sp)
+                                }
+                                Spacer(Modifier.height(8.dp))
+                                Text(job.state.uppercase(Locale.US), color = border, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
+                                if (job.address.isNotBlank()) Text(job.address, color = muted, maxLines = 2)
+                                if (job.startDate.isNotBlank()) Text(scheduleSummary(job), color = muted)
+                                if (job.address.isBlank() && job.startDate.isBlank()) Text("Job #${job.id.take(6)}", color = muted)
                             }
-                            Spacer(Modifier.height(8.dp))
-                            Text(job.state.uppercase(Locale.US), color = border, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
-                            if (job.address.isNotBlank()) Text(job.address, color = muted, maxLines = 2)
-                            if (job.startDate.isNotBlank()) Text(scheduleSummary(job), color = muted)
-                            if (job.address.isBlank() && job.startDate.isBlank()) Text("Job #${job.id.take(6)}", color = muted)
                         }
                     }
                 }
@@ -224,11 +243,19 @@ internal fun DetailScreen(job: Job, modifier: Modifier, onEdit: (Int) -> Unit, o
     onActivate: () -> Unit, onPlan: () -> Unit, onComplete: () -> Unit) {
     Column(modifier.verticalScroll(rememberScrollState()).padding(20.dp)) {
         Text(job.state.uppercase(Locale.US), color = if (job.state == Job.ACTIVE) green else muted, fontWeight = FontWeight.Bold)
-        PageTitle(job.label, if (job.state == Job.COMPLETED) "Saved in history" else "Everything you need on site")
+        PageTitle(job.label, if (job.state == Job.COMPLETED) "Saved in history" else "Everything you need on-site")
         when (job.state) {
-            Job.ACTIVE -> OutlinedButton(onClick = onPlan) { Text("Move to planned") }
-            Job.PLANNED -> Button(onClick = onActivate) { Text("Activate") }
-            Job.COMPLETED -> OutlinedButton(onClick = onPlan) { Text("Restore to planned") }
+            Job.ACTIVE, Job.PLANNED -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (job.state == Job.ACTIVE) {
+                    OutlinedButton(onClick = onPlan, modifier = Modifier.weight(1f)) { Text("Move to planned") }
+                } else {
+                    Button(onClick = onActivate, modifier = Modifier.weight(1f)) { Text("Activate") }
+                }
+                OutlinedButton(onClick = onComplete, modifier = Modifier.weight(1f)) { Text("Mark completed") }
+            }
+            Job.COMPLETED -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                OutlinedButton(onClick = onPlan) { Text("Restore to planned") }
+            }
         }
         OutlinedButton(onClick = onShare, modifier = Modifier.fillMaxWidth()) { Text("Share job · QR") }
         OutlinedButton(onClick = onPdf, modifier = Modifier.fillMaxWidth()) { Text("Share job · PDF") }
@@ -270,7 +297,6 @@ internal fun DetailScreen(job: Job, modifier: Modifier, onEdit: (Int) -> Unit, o
                 }
             }
         }
-        if (job.state != Job.COMPLETED) OutlinedButton(onClick = onComplete, modifier = Modifier.fillMaxWidth()) { Text("Mark completed") }
         Spacer(Modifier.height(30.dp))
     }
 }

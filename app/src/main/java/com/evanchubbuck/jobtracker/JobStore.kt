@@ -61,6 +61,10 @@ class JobStore(context: Context) {
         prefs.edit().putString("costs_$jobId", array.toString()).putLong("costs_updated_$jobId", updatedAt).apply()
     }
 
+    fun deleteCosts(jobId: String) {
+        prefs.edit().remove("costs_$jobId").remove("costs_updated_$jobId").apply()
+    }
+
     fun saveDraft(job: Job?) {
         prefs.edit().apply {
             if (job == null) { remove("draft"); remove("draft_step") }
