@@ -276,10 +276,6 @@ class MainActivity : ComponentActivity() {
                     } else {
                         TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }
                     }
-                    Spacer(Modifier.weight(1f))
-                    if (screen == "detail") {
-                        TextButton(onClick = { screen = "home" }) { Text("Home", color = UiCanvas) }
-                    }
                 }
             }
         }) { padding ->
