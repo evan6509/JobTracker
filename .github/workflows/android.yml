@@ -58,23 +58,51 @@ jobs:
           retention-days: 30
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
+      - name: Check app version and existing release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' app/build.gradle.kts)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected one numeric versionName in app/build.gradle.kts" >&2
+            exit 1
+          fi
+          tag="v$version"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match app version $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "create=false" >> "$GITHUB_OUTPUT"
+            echo "Release $tag already exists; skipping publication."
+          else
+            echo "create=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download APK
+        if: steps.version.outputs.create == 'true'
         uses: actions/download-artifact@v4
         with:
           name: JobTracker-debug-apk
           path: release
 
-      - name: Publish tagged release
+      - name: Publish release
+        if: steps.version.outputs.create == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          mv release/app-debug.apk "release/JobTracker-${GITHUB_REF_NAME}-debug.apk"
-          gh release create "$GITHUB_REF_NAME" "release/JobTracker-${GITHUB_REF_NAME}-debug.apk" \
-            --repo "$GITHUB_REPOSITORY" --title "JobTracker $GITHUB_REF_NAME" \
-            --generate-notes --verify-tag
+          mv release/app-debug.apk "release/JobTracker-${RELEASE_TAG}-debug.apk"
+          gh release create "$RELEASE_TAG" "release/JobTracker-${RELEASE_TAG}-debug.apk" \
+            --repo "$GITHUB_REPOSITORY" --title "JobTracker $RELEASE_TAG" \
+            --generate-notes --target "$GITHUB_SHA"

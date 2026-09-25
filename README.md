@@ -1,16 +1,16 @@
 # JobTracker
 
-An offline Android app for organizing current, planned, and completed jobs. The home screen keeps active and planned jobs in a drag-reorderable priority list. Setup has eight steps, including an optional inventory list, and saves an unfinished draft so it can be resumed. Dark mode is the default; use the switch on Home for light mode.
+An offline Android app for organizing current, planned, and completed jobs. The home screen keeps active and planned jobs in a drag-reorderable priority list. Setup has eight steps, including an optional inventory list, and saves an unfinished draft so it can be resumed. Dark mode is the default; use the switch in Settings for light mode.
 
 ## Build and install
 
 Open this directory in Android Studio, or run `./gradlew :app:assembleDebug`. The debug APK is at `app/build/outputs/apk/debug/app-debug.apk` and can be installed on an Android 7.0+ device.
 
-GitHub Actions builds, tests, and lints every push and pull request. Download the `JobTracker-debug-apk` artifact from a successful `main` push to install that build. Pushing a version tag such as `v1.1.1` also creates a GitHub Release with the APK attached. Pull requests do not publish installable artifacts.
+GitHub Actions builds, tests, and lints every push and pull request. On a successful `main` push, it reads `versionName` from `app/build.gradle.kts` and automatically creates a GitHub Release and version tag with the APK if that version has not been released yet. Later pushes with the same version do not create another release. Bump both `versionName` and `versionCode` for a new installable version. Pushing a matching version tag also publishes a release if it is missing. Pull requests do not publish installable artifacts.
 
 The `main` and tagged APKs use the same debug signing key as the local build, so they can update the installed app. The key is stored as a GitHub Actions secret and is unavailable to pull requests. Keep a backup of the signing key; a different key cannot update existing installs.
 
-On Home, tap **Check for updates** to compare the installed version with the latest published GitHub Release. If a newer release has a `JobTracker-vX.Y.Z-debug.apk` asset, tap **Download APK** and then the completed download notification to install it. Android may ask you to allow installs from JobTracker. Checking requires an internet connection; jobs remain available offline.
+On Home, open the menu and tap **Check for updates** to compare the installed version with the latest published GitHub Release. If a newer release has a `JobTracker-vX.Y.Z-debug.apk` asset, tap **Download APK** and then the completed download notification to install it. Android may ask you to allow installs from JobTracker. Checking requires an internet connection; jobs remain available offline.
 
 ## Job sharing
 
