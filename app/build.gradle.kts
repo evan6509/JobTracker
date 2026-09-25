@@ -13,8 +13,8 @@ android {
         applicationId = "com.evanchubbuck.jobtracker"
         minSdk = 24
         targetSdk = 37
-        versionCode = 8
-        versionName = "1.2.3"
+        versionCode = providers.environmentVariable("JOBTRACKER_VERSION_CODE").orNull?.toInt() ?: 8
+        versionName = providers.environmentVariable("JOBTRACKER_VERSION_NAME").orNull ?: "1.2.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

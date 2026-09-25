@@ -11,8 +11,26 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Assign version to main push
+        id: version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          # Run 16 published v1.2.3. Each later workflow run gets a unique higher version.
+          release_number=$((GITHUB_RUN_NUMBER - 16))
+          if (( release_number < 1 )); then
+            echo 'Expected a workflow run after v1.2.3' >&2
+            exit 1
+          fi
+          version="1.2.$((3 + release_number))"
+          code="$((8 + release_number))"
+          echo "JOBTRACKER_VERSION_NAME=$version" >> "$GITHUB_ENV"
+          echo "JOBTRACKER_VERSION_CODE=$code" >> "$GITHUB_ENV"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
       - name: Set up Java
         uses: actions/setup-java@v6
@@ -58,7 +76,7 @@ jobs:
           retention-days: 30
 
   release:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -66,47 +84,33 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check app version and existing release
-        id: version
+      - name: Check existing release
+        id: existing
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
         run: |
-          version="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' app/build.gradle.kts)"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Expected one numeric versionName in app/build.gradle.kts" >&2
-            exit 1
-          fi
-          tag="v$version"
-          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "$tag" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match app version $tag" >&2
-            exit 1
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "create=false" >> "$GITHUB_OUTPUT"
-            echo "Release $tag already exists; skipping publication."
+            echo "Release $RELEASE_TAG already exists; skipping publication."
           else
-            if [[ ! -s "release-notes/$tag.md" ]]; then
-              echo "Add written release notes to release-notes/$tag.md before publishing $tag" >&2
-              exit 1
-            fi
             echo "create=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download APK
-        if: steps.version.outputs.create == 'true'
+        if: steps.existing.outputs.create == 'true'
         uses: actions/download-artifact@v4
         with:
           name: JobTracker-debug-apk
           path: release
 
       - name: Publish release
-        if: steps.version.outputs.create == 'true'
+        if: steps.existing.outputs.create == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
         run: |
           mv release/app-debug.apk "release/JobTracker-${RELEASE_TAG}-debug.apk"
           gh release create "$RELEASE_TAG" "release/JobTracker-${RELEASE_TAG}-debug.apk" \
             --repo "$GITHUB_REPOSITORY" --title "JobTracker $RELEASE_TAG" \
-            --notes-file "release-notes/${RELEASE_TAG}.md" --target "$GITHUB_SHA"
+            --generate-notes --target "$GITHUB_SHA"
