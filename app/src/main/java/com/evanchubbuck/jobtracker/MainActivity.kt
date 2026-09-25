@@ -33,6 +33,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.content.ContextCompat
@@ -76,6 +77,7 @@ class MainActivity : ComponentActivity() {
     private fun JobTrackerApp(darkMode: Boolean, onDarkMode: (Boolean) -> Unit) {
         val store = remember { JobStore(this) }
         val sync = remember { WifiDirectSync(this, store) }
+        val releaseUpdatesEnabled = remember { resources.getBoolean(R.bool.release_updates_enabled) }
         val installedVersion = remember {
             runCatching { packageManager.getPackageInfo(packageName, 0).versionName.orEmpty() }.getOrDefault("")
         }
@@ -214,7 +216,7 @@ class MainActivity : ComponentActivity() {
         }
         fun scan() { scanner.launch(ScanOptions().setCaptureActivity(JobScannerActivity::class.java).setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Scan a JobTracker job QR code").setBeepEnabled(false).setOrientationLocked(false)) }
         fun checkForUpdate() {
-            if (checkingUpdate) return
+            if (!releaseUpdatesEnabled || checkingUpdate) return
             checkingUpdate = true
             scope.launch {
                 try {
@@ -258,16 +260,18 @@ class MainActivity : ComponentActivity() {
                                 DropdownMenuItem(text = { Text("Settings") }, onClick = {
                                     menuExpanded = false; screen = "settings"
                                 })
-                                DropdownMenuItem(text = { Text("Check for updates") }, onClick = {
-                                    menuExpanded = false; checkForUpdate()
-                                })
+                                if (releaseUpdatesEnabled) {
+                                    DropdownMenuItem(text = { Text("Check for updates") }, onClick = {
+                                        menuExpanded = false; checkForUpdate()
+                                    })
+                                }
                                 HorizontalDivider()
                                 DropdownMenuItem(text = { Text("Clear all data", color = MaterialTheme.colorScheme.error) }, onClick = {
                                     menuExpanded = false; clearAllData = true
                                 })
                             }
                         }
-                        Text("Job Tracker", color = UiCanvas, style = MaterialTheme.typography.titleMedium,
+                        Text(stringResource(R.string.app_name), color = UiCanvas, style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 8.dp))
                     } else {
                         TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }

@@ -19,6 +19,21 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("local") {
+            dimension = "distribution"
+            applicationIdSuffix = ".local"
+            versionCode = 1
+            versionName = "0.0.0"
+            resValue("bool", "release_updates_enabled", "false")
+        }
+        create("published") {
+            dimension = "distribution"
+            resValue("bool", "release_updates_enabled", "true")
+        }
+    }
+
     buildTypes {
         release {
             optimization {
@@ -32,6 +47,7 @@ android {
     }
     buildFeatures {
         compose = true
+        resValues = true
     }
 }
 
