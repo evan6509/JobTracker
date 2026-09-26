@@ -12,6 +12,7 @@ import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.UnknownHostException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 
 internal data class GitHubRelease(val tag: String, val apkUrl: String)
@@ -38,6 +39,18 @@ internal fun isNewerRelease(tag: String, installedVersion: String): Boolean {
     val latest = versionPattern.matchEntire(tag)?.groupValues?.drop(1)?.map(String::toInt) ?: return false
     val installed = versionPattern.matchEntire(installedVersion)?.groupValues?.drop(1)?.map(String::toInt) ?: return false
     return latest.zip(installed).firstOrNull { (a, b) -> a != b }?.let { (a, b) -> a > b } ?: false
+}
+
+/** One quiet attempt per app opening; failed checks are left for the next opening. */
+internal suspend fun startupUpdate(
+    installedVersion: String,
+    fetch: suspend () -> GitHubRelease = ::fetchLatestRelease
+): GitHubRelease? = try {
+    fetch().takeIf { isNewerRelease(it.tag, installedVersion) }
+} catch (error: CancellationException) {
+    throw error
+} catch (_: Exception) {
+    null
 }
 
 internal suspend fun fetchLatestRelease(): GitHubRelease = withContext(Dispatchers.IO) {

@@ -1,7 +1,0 @@
-# JobTracker development and release workflow
-
-- For one accumulating batch across Codex chats, use the project's Local checkout at `/Users/evanchubbuck/AndroidStudioProjects/JobTracker` for each chat. Check `git status` before editing and preserve unfinished local changes. A separate Codex worktree is an isolated copy; hand its changes back to Local before starting the next incremental task.
-- For development on the Pixel, build and install `:app:assembleLocalDebug`. Its app ID is `com.evanchubbuck.jobtracker.local`, its version is `0.0.0`, and its data is separate from the published app. Reinstall this variant for each local change. Do not use the published variant for routine phone testing.
-- Local commits can save progress across chats without publishing it. Keep work local until the user explicitly asks to publish or push it. A push to `main` starts a numbered GitHub Release, so do not push, tag, or create a release as part of routine development.
-- When publication is requested, inspect the changes, build and verify `publishedDebug`, then push and verify the GitHub workflow and attached APK. GitHub must upload only `app-published-debug.apk` from the `publishedDebug` output. Never publish `app-local-debug.apk` or any APK whose version is `0.0.0`.
-- The source code for both variants lives in this repository. Publishing code to GitHub includes the local variant's configuration, but the GitHub Release contains only the numbered published APK.

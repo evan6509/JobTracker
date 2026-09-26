@@ -3,6 +3,8 @@ package com.evanchubbuck.jobtracker
 import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
@@ -23,7 +25,21 @@ internal fun sampledBitmap(path: String): Bitmap? = runCatching {
     BitmapFactory.decodeFile(path, bounds)
     var sample = 1
     while (bounds.outWidth / sample > 1200 || bounds.outHeight / sample > 1200) sample *= 2
-    BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
+    val bitmap = BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return@runCatching null
+    val orientation = runCatching { ExifInterface(path).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL) }
+        .getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+    val matrix = Matrix().apply {
+        when (orientation) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> setScale(-1f, 1f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> setRotate(180f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> setScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> { setRotate(90f); postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_ROTATE_90 -> setRotate(90f)
+            ExifInterface.ORIENTATION_TRANSVERSE -> { setRotate(270f); postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_ROTATE_270 -> setRotate(270f)
+        }
+    }
+    if (matrix.isIdentity) bitmap else Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true).also { bitmap.recycle() }
 }.getOrNull()
 
 internal fun copyPhoto(activity: Activity, uri: Uri): String? = runCatching {
@@ -49,6 +65,20 @@ internal fun validPhone(value: String): Boolean {
     if (value.isBlank()) return true
     val digits = value.count { it.isDigit() }
     return digits in 3..15 && value.all { it.isDigit() || it in "+-(). " }
+}
+
+internal fun phoneInput(value: String): String {
+    val digits = value.filter(Char::isDigit)
+    return if (digits.length <= 10 && value.all { it.isDigit() || it == '-' || it == ' ' }) digits else value
+}
+
+internal fun displayPhone(value: String): String {
+    if (value.isEmpty() || value.length > 10 || !value.all(Char::isDigit)) return value
+    return buildString {
+        append(value.take(3))
+        if (value.length > 3) { append('-'); append(value.substring(3, minOf(6, value.length))) }
+        if (value.length > 6) { append('-'); append(value.substring(6)) }
+    }
 }
 
 internal fun validationError(job: Job): String? = when {

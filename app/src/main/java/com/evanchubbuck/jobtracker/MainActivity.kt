@@ -33,10 +33,13 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.evanchubbuck.jobtracker.ui.theme.JobTrackerTheme
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -76,6 +79,10 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun JobTrackerApp(darkMode: Boolean, onDarkMode: (Boolean) -> Unit) {
         val store = remember { JobStore(this) }
+        val settings = remember { getSharedPreferences("job_tracker_settings", MODE_PRIVATE) }
+        var qrSharing by remember { mutableStateOf(settings.getBoolean("share_qr", true)) }
+        var pdfSharing by remember { mutableStateOf(settings.getBoolean("share_pdf", true)) }
+        var instantDeleteOnLongSwipe by remember { mutableStateOf(settings.getBoolean("instant_draft_delete", false)) }
         val sync = remember { WifiDirectSync(this, store) }
         val releaseUpdatesEnabled = remember { resources.getBoolean(R.bool.release_updates_enabled) }
         val installedVersion = remember {
@@ -90,22 +97,24 @@ class MainActivity : ComponentActivity() {
             if (Build.VERSION.SDK_INT >= 37) networkAllowed = grants[Manifest.permission.ACCESS_LOCAL_NETWORK] == true
         }
         var jobs by remember { mutableStateOf(store.jobs()) }
-        var draft by remember { mutableStateOf(store.draft()) }
+        var drafts by remember { mutableStateOf(store.drafts()) }
+        var recycled by remember { mutableStateOf(store.recycled()) }
         var screen by rememberSaveable { mutableStateOf("home") }
         var selectedId by rememberSaveable { mutableStateOf("") }
         var editingId by rememberSaveable { mutableStateOf("") }
+        var activeDraftId by rememberSaveable { mutableStateOf("") }
         var editor by remember { mutableStateOf<Job?>(null) }
         var step by rememberSaveable { mutableIntStateOf(0) }
         var error by remember { mutableStateOf("") }
         var message by remember { mutableStateOf("") }
-        var replaceDraft by remember { mutableStateOf(false) }
-        var deleteDraft by remember { mutableStateOf(false) }
+        var deleteDraftId by remember { mutableStateOf<String?>(null) }
         var clearAllData by remember { mutableStateOf(false) }
         var menuExpanded by remember { mutableStateOf(false) }
         var activateId by remember { mutableStateOf<String?>(null) }
         var completeId by remember { mutableStateOf<String?>(null) }
         var deleteJobId by remember { mutableStateOf<String?>(null) }
         var photoPath by remember { mutableStateOf<String?>(null) }
+        var cameraJobId by rememberSaveable { mutableStateOf("") }
         var pdfPath by rememberSaveable { mutableStateOf("") }
         var pdfSubject by rememberSaveable { mutableStateOf("") }
         var pdfReturnScreen by rememberSaveable { mutableStateOf("detail") }
@@ -117,6 +126,29 @@ class MainActivity : ComponentActivity() {
         val scanPreview = remember(scanRaw) { runCatching { if (scanRaw.isBlank()) null else JSONObject(scanRaw).getJSONObject("job").toJob() }.getOrNull() }
         val scanSource = remember(scanRaw) { runCatching { JSONObject(scanRaw).getString("source") }.getOrDefault("") }
         val scope = rememberCoroutineScope()
+        DisposableEffect(releaseUpdatesEnabled) {
+            var startupCheck: kotlinx.coroutines.Job? = null
+            fun checkOnOpen() {
+                if (releaseUpdatesEnabled && startupCheck?.isActive != true) {
+                    startupCheck = scope.launch {
+                        startupUpdate(installedVersion)?.let { latestRelease = it }
+                    }
+                }
+            }
+            val observer = LifecycleEventObserver { _, event ->
+                when (event) {
+                    Lifecycle.Event.ON_START -> checkOnOpen()
+                    Lifecycle.Event.ON_STOP -> startupCheck?.cancel()
+                    else -> Unit
+                }
+            }
+            lifecycle.addObserver(observer)
+            if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) checkOnOpen()
+            onDispose {
+                lifecycle.removeObserver(observer)
+                startupCheck?.cancel()
+            }
+        }
 
         DisposableEffect(screen, nearbyAllowed, networkAllowed) {
             if (screen == "sync" && nearbyAllowed && networkAllowed) sync.start()
@@ -125,43 +157,79 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(sync.result) {
             if (sync.result != null) {
                 jobs = store.jobs()
-                draft = store.draft()
+                drafts = store.drafts()
                 costs = store.costs(selectedId)
             }
         }
 
         fun persist(list: List<Job>) { jobs = list; store.saveJobs(list) }
         fun deleteUnusedPhotos(paths: List<String>, usedPhotos: Set<String>) {
-            val photoFolder = File(filesDir, "photos").canonicalPath + File.separator
-            paths.filter { path ->
-                path !in usedPhotos && runCatching { File(path).canonicalPath.startsWith(photoFolder) }.getOrDefault(false)
-            }.forEach { File(it).delete() }
+            val retainedPhotos = usedPhotos + store.recycled().flatMap { it.job.photos }
+            deleteUnreferencedJobPhotos(this@MainActivity, paths, retainedPhotos)
         }
-        fun discardDraft() {
-            draft?.photos?.let { deleteUnusedPhotos(it, jobs.flatMap { job -> job.photos }.toSet()) }
-            draft = null
-            store.saveDraft(null)
+        fun discardDraft(id: String) {
+            if (!store.recycle(id, draft = true)) return
+            drafts = store.drafts()
+            recycled = store.recycled()
         }
         fun deleteSavedJob(id: String) {
-            val job = jobs.firstOrNull { it.id == id && it.state != Job.COMPLETED } ?: return
-            val remaining = jobs.filterNot { it.id == id }
-            persist(remaining)
-            store.deleteCosts(id)
-            val usedPhotos = remaining.flatMap { it.photos }.toSet() + (draft?.photos ?: emptyList())
-            deleteUnusedPhotos(job.photos, usedPhotos)
+            if (jobs.none { it.id == id && it.state != Job.COMPLETED } || !store.recycle(id, draft = false)) return
+            jobs = store.jobs()
+            recycled = store.recycled()
             selectedId = ""
             screen = "home"
         }
+        fun restoreRecycled(id: String) {
+            when (store.restoreRecycled(id)) {
+                RecycleRestoreResult.RESTORED -> {
+                    jobs = store.jobs()
+                    drafts = store.drafts()
+                    recycled = store.recycled()
+                }
+                RecycleRestoreResult.DRAFT_LIMIT -> message = "You already have three drafts. Finish a draft or move one to the Recycle bin, then try again."
+                RecycleRestoreResult.ALREADY_EXISTS -> message = "This job or draft is already on this phone. The copy in the Recycle bin has been kept."
+                RecycleRestoreResult.MISSING -> recycled = store.recycled()
+            }
+        }
+        fun deleteRecycledForever(ids: Set<String>) {
+            val removed = store.deleteRecycled(ids)
+            recycled = store.recycled()
+            val usedPhotos = jobs.flatMap { it.photos }.toSet() + drafts.flatMap { it.photos }
+            deleteUnusedPhotos(removed.flatMap { it.job.photos }, usedPhotos)
+        }
         fun changeEditor(value: Job) {
             editor = value
-            if (editingId.isBlank()) { val changed = value.copy(updatedAt = System.currentTimeMillis()); draft = changed; editor = changed; store.saveDraft(changed) }
+            if (editingId.isBlank()) {
+                val changed = value.copy(updatedAt = System.currentTimeMillis())
+                drafts = drafts.map { if (it.id == activeDraftId) changed else it }
+                editor = changed
+                store.saveDraft(changed)
+            }
             else persist(jobs.map { if (it.id == editingId) value.copy(updatedAt = System.currentTimeMillis()) else it })
         }
         fun openEditor(id: String = "", section: Int = 0) {
             editingId = id
-            editor = if (id.isBlank()) draft ?: Job() else jobs.firstOrNull { it.id == id }
-            if (id.isBlank()) editor?.let { draft = it; store.saveDraft(it) }
-            step = if (id.isBlank() && draft != null) store.draftStep() else section
+            if (id.isBlank()) {
+                if (drafts.size >= 3) { screen = "drafts"; return }
+                val newDraft = Job()
+                activeDraftId = newDraft.id
+                store.saveDraft(newDraft)
+                drafts = drafts + newDraft
+                editor = newDraft
+                step = 0
+            } else {
+                activeDraftId = ""
+                editor = jobs.firstOrNull { it.id == id }
+                step = section
+            }
+            error = ""; screen = "editor"
+        }
+        fun openDraft(id: String) {
+            val draft = drafts.firstOrNull { it.id == id } ?: return
+            editingId = ""
+            activeDraftId = id
+            editor = draft
+            step = store.draftStep(id)
             error = ""; screen = "editor"
         }
         fun setState(id: String, state: String) {
@@ -169,8 +237,11 @@ class MainActivity : ComponentActivity() {
         }
         fun back() {
             when (screen) {
-                "editor" -> if (step > 0) { step--; if (editingId.isBlank()) { store.saveDraftStep(step); draft?.let(::changeEditor) }; error = "" } else { screen = if (editingId.isBlank()) "home" else "detail"; editor = null }
+                "editor" -> if (editingId.isNotBlank() && step == 6) { screen = "detail"; editor = null }
+                    else if (step > 0) { step--; if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step); error = "" }
+                    else { screen = if (editingId.isBlank()) "drafts" else "detail"; editor = null }
                 "share", "costs" -> screen = "detail"
+                "recycle_bin" -> screen = "settings"
                 "pdf" -> { screen = pdfReturnScreen; pdfPath = ""; pdfSubject = "" }
                 else -> screen = "home"
             }
@@ -228,17 +299,34 @@ class MainActivity : ComponentActivity() {
             }
         }
         val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
-            val current = editor
+            val current = editor ?: if (editingId.isBlank()) drafts.firstOrNull { it.id == activeDraftId }
+                else jobs.firstOrNull { it.id == editingId }
             if (current != null && uris.isNotEmpty()) {
                 val editSession = editingId
                 scope.launch {
                     val paths = withContext(Dispatchers.IO) { uris.mapNotNull { copyPhoto(this@MainActivity, it) } }
-                    val latest = editor
-                    if (latest?.id == current.id && editingId == editSession) changeEditor(latest.copy(photos = latest.photos + paths))
+                    val latest = editor ?: if (editingId.isBlank()) drafts.firstOrNull { it.id == activeDraftId }
+                        else jobs.firstOrNull { it.id == editingId }
+                    if (latest?.id == current.id && editingId == editSession && screen == "editor") changeEditor(latest.copy(photos = latest.photos + paths))
                     else paths.forEach { File(it).delete() }
                     if (paths.size != uris.size) message = "Some photos could not be added."
                 }
             }
+        }
+        val photoCamera = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == RESULT_OK) result.data?.getStringExtra(PhotoCaptureActivity.PHOTO_PATH)?.let { path ->
+                val updated = attachCapturedPhoto(this@MainActivity, store, cameraJobId, path)
+                if (updated == null) {
+                    val used = (store.jobs() + store.drafts()).flatMap { it.photos }.toSet()
+                    deleteUnusedPhotos(listOf(path), used)
+                    message = "This job or draft is no longer available. The photo wasn't added."
+                } else {
+                    jobs = store.jobs()
+                    drafts = store.drafts()
+                    if ((editingId.ifBlank { activeDraftId }) == updated.id) editor = updated
+                }
+            }
+            cameraJobId = ""
         }
         val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
             if (result.contents != null) {
@@ -312,6 +400,10 @@ class MainActivity : ComponentActivity() {
                         }
                         Text(stringResource(R.string.app_name), color = UiCanvas, style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 8.dp))
+                        Spacer(Modifier.weight(1f))
+                        IconButton(onClick = { screen = "history" }) {
+                            Icon(painterResource(R.drawable.ic_history), contentDescription = "History", tint = UiCanvas)
+                        }
                     } else {
                         TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }
                     }
@@ -320,15 +412,35 @@ class MainActivity : ComponentActivity() {
         }) { padding ->
             val area = Modifier.fillMaxSize().padding(padding)
             when (screen) {
-                "home" -> HomeScreen(jobs, draft != null, area, onNew = { if (draft == null) openEditor() else replaceDraft = true }, onResume = { openEditor() },
-                    onOpen = { selectedId = it; screen = "detail" }, onHistory = { screen = "history" }, onScan = { scan() },
-                    onSync = { screen = "sync" },
+                "home" -> HomeScreen(jobs, drafts.size, area, onNew = { openEditor() }, onDrafts = { screen = "drafts" },
+                    onOpen = { selectedId = it; screen = "detail" }, onScan = { scan() },
+                    onSync = { sync.resetSelection(); screen = "sync" },
                     onReorder = { from, to ->
                         persist(reorderVisibleJobs(jobs, from, to))
-                    }, onDeleteDraft = { deleteDraft = true }, onDeleteJob = { deleteJobId = it })
-                "settings" -> SettingsScreen(darkMode, onDarkMode, installedVersion, area)
+                    }, onDeleteJob = { deleteJobId = it }, onDeleteJobImmediately = { deleteSavedJob(it) },
+                    instantDeleteOnLongSwipe = instantDeleteOnLongSwipe)
+                "drafts" -> DraftsScreen(drafts, area, onNew = { openEditor() }, onOpen = { openDraft(it) },
+                    onDelete = { deleteDraftId = it }, onDeleteImmediately = { discardDraft(it) },
+                    instantDeleteOnLongSwipe = instantDeleteOnLongSwipe)
+                "settings" -> SettingsScreen(darkMode, onDarkMode,
+                    qrSharing, { enabled ->
+                        if (enabled || pdfSharing) {
+                            qrSharing = enabled
+                            settings.edit().putBoolean("share_qr", enabled).apply()
+                        }
+                    }, pdfSharing, { enabled ->
+                        if (enabled || qrSharing) {
+                            pdfSharing = enabled
+                            settings.edit().putBoolean("share_pdf", enabled).apply()
+                        }
+                    }, instantDeleteOnLongSwipe, { enabled ->
+                        instantDeleteOnLongSwipe = enabled
+                        settings.edit().putBoolean("instant_draft_delete", enabled).apply()
+                    }, installedVersion, area, onRecycleBin = { recycled = store.recycled(); screen = "recycle_bin" })
+                "recycle_bin" -> RecycleBinScreen(recycled, area, onRestore = { restoreRecycled(it) },
+                    onDeleteForever = { deleteRecycledForever(it) })
                 "history" -> HistoryScreen(jobs.filter { it.state == Job.COMPLETED }, area) { selectedId = it; screen = "detail" }
-                "sync" -> SyncScreen(sync, nearbyAllowed && networkAllowed, {
+                "sync" -> SyncScreen(sync, jobs, drafts, nearbyAllowed && networkAllowed, {
                     nearbyRequest.launch(if (Build.VERSION.SDK_INT in 31..32)
                         arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
                     else if (Build.VERSION.SDK_INT >= 37)
@@ -339,19 +451,22 @@ class MainActivity : ComponentActivity() {
                     DetailScreen(job, area, onEdit = { openEditor(job.id, it) }, onNavigate = { navigate(job.address) },
                         onCalendar = { calendar(job) }, onCall = { phone -> launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")), "No phone app is available.") },
                         onPhoto = { photoPath = it }, onShare = { screen = "share" }, onPdf = { previewPdf(job, false) },
+                        qrSharing = qrSharing, pdfSharing = pdfSharing,
                         onCosts = { costs = store.costs(job.id); screen = "costs" },
                         onActivate = { if (jobs.any { it.state == Job.ACTIVE && it.id != job.id }) activateId = job.id else setState(job.id, Job.ACTIVE) },
                         onPlan = { setState(job.id, Job.PLANNED) }, onComplete = { completeId = job.id })
                 }
                 "editor" -> {
-                    val current = editor ?: if (editingId.isBlank()) draft ?: Job() else jobs.firstOrNull { it.id == editingId }
+                    val current = editor ?: if (editingId.isBlank()) drafts.firstOrNull { it.id == activeDraftId } else jobs.firstOrNull { it.id == editingId }
                     if (current != null) EditorScreen(current, step, editingId.isNotBlank(), error, area,
-                        onChange = { changeEditor(it); error = "" }, onStep = { step = it; if (editingId.isBlank()) { store.saveDraftStep(step); draft?.let(::changeEditor) }; error = "" }, onBack = { back() },
-                        onExit = { editor = null; screen = if (editingId.isBlank()) "home" else "detail" },
+                        onChange = { changeEditor(it); error = "" }, onStep = { step = it; if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step); error = "" }, onBack = { back() },
+                        onExit = { editor = null; screen = if (editingId.isBlank()) "drafts" else "detail" },
                         onPickPhotos = { picker.launch("image/*") }, onPhoto = { photoPath = it },
+                        onTakePhoto = { cameraJobId = current.id; photoCamera.launch(Intent(this@MainActivity, PhotoCaptureActivity::class.java)) },
                         onRemovePhoto = { path ->
                             changeEditor(current.copy(photos = current.photos - path))
-                            if (path.startsWith(File(filesDir, "photos").canonicalPath + File.separator)) File(path).delete()
+                            val usedPhotos = jobs.flatMap { it.photos }.toSet() + drafts.flatMap { it.photos }
+                            deleteUnusedPhotos(listOf(path), usedPhotos)
                         }, onNavigate = { navigate(current.address) }, onCalendar = { calendar(current) },
                         onFinish = {
                             val problem = validationError(current)
@@ -363,14 +478,17 @@ class MainActivity : ComponentActivity() {
                                     current.inventory.any { it.name.isBlank() && (it.quantity.isNotBlank() || it.notes.isNotBlank()) } -> 4
                                     else -> 2
                                 }
-                                if (editingId.isBlank()) store.saveDraftStep(step)
+                                if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step)
                             } else if (editingId.isBlank()) {
                                 val saved = current.copy(clients = current.clients.filter { it.name.isNotBlank() },
                                     workers = current.workers.filter { it.name.isNotBlank() || it.phone.isNotBlank() || it.work.isNotBlank() },
                                     inventory = current.inventory.filter { it.name.isNotBlank() },
                                     priority = (jobs.maxOfOrNull { it.priority } ?: -1) + 1, updatedAt = System.currentTimeMillis())
                                 val hadActive = jobs.any { it.state == Job.ACTIVE }
-                                persist(jobs + saved); draft = null; store.saveDraft(null); editor = null
+                                persist(jobs + saved)
+                                store.deleteDraft(activeDraftId)
+                                drafts = drafts.filterNot { it.id == activeDraftId }
+                                activeDraftId = ""; editor = null
                                 selectedId = saved.id; screen = "detail"
                                 if (!hadActive) activateId = saved.id
                             } else { editor = null; selectedId = editingId; screen = "detail" }
@@ -398,21 +516,14 @@ class MainActivity : ComponentActivity() {
                 confirmButton = { TextButton(onClick = { setState(id, Job.ACTIVE); activateId = null }) { Text("Activate") } },
                 dismissButton = { TextButton(onClick = { activateId = null }) { Text(if (previous == null) "Keep planned" else "Cancel") } })
         }
-        if (replaceDraft) AlertDialog(onDismissRequest = { replaceDraft = false },
-            title = { Text("Start a different job?") },
-            text = { Text("This will discard the unfinished draft. You can resume it instead from Home.") },
-            confirmButton = { TextButton(onClick = {
-                discardDraft(); replaceDraft = false; openEditor()
-            }) { Text("Discard draft") } },
-            dismissButton = { TextButton(onClick = { replaceDraft = false }) { Text("Cancel") } })
-        if (deleteDraft) AlertDialog(onDismissRequest = { deleteDraft = false },
-            title = { Text("Delete unfinished job?") },
-            text = { Text("Your saved setup and photos stored only with this draft will be deleted.") },
-            confirmButton = { TextButton(onClick = { discardDraft(); deleteDraft = false }) { Text("Delete") } },
-            dismissButton = { TextButton(onClick = { deleteDraft = false }) { Text("Cancel") } })
+        deleteDraftId?.let { id -> AlertDialog(onDismissRequest = { deleteDraftId = null },
+            title = { Text("Delete ${drafts.firstOrNull { it.id == id }?.label ?: "draft"}?") },
+            text = { Text("This moves the draft and its photos to the Recycle bin in Settings. You can restore it later.") },
+            confirmButton = { TextButton(onClick = { discardDraft(id); deleteDraftId = null }) { Text("Delete") } },
+            dismissButton = { TextButton(onClick = { deleteDraftId = null }) { Text("Cancel") } }) }
         if (clearAllData) AlertDialog(onDismissRequest = { clearAllData = false },
             title = { Text("Clear all JobTracker data?") },
-            text = { Text("This erases all jobs, drafts, photos saved in JobTracker, private costs, settings, and app permissions on this phone. Copies exported elsewhere remain. The app will close.") },
+            text = { Text("This erases all jobs, drafts, the Recycle bin, photos saved in JobTracker, private costs, settings, and app permissions on this phone. Copies exported elsewhere remain. The app will close.") },
             confirmButton = { TextButton(onClick = {
                 clearAllData = false
                 val cleared = runCatching {
@@ -427,7 +538,7 @@ class MainActivity : ComponentActivity() {
             dismissButton = { TextButton(onClick = { completeId = null }) { Text("Cancel") } }) }
         deleteJobId?.let { id -> AlertDialog(onDismissRequest = { deleteJobId = null },
             title = { Text("Delete ${jobs.firstOrNull { it.id == id }?.label ?: "job"}?") },
-            text = { Text("This permanently deletes the job, its private costs, and photos stored only with this job. This cannot be undone.") },
+            text = { Text("This moves the job, its costs, and photos to the Recycle bin in Settings. You can restore it later.") },
             confirmButton = { TextButton(onClick = { deleteSavedJob(id); deleteJobId = null }) { Text("Delete", color = MaterialTheme.colorScheme.error) } },
             dismissButton = { TextButton(onClick = { deleteJobId = null }) { Text("Cancel") } }) }
         photoPath?.let { path -> AlertDialog(onDismissRequest = { photoPath = null },

@@ -49,6 +49,16 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         private set
     var busy by mutableStateOf(false)
         private set
+    var selection by mutableStateOf(SyncSelection())
+        private set
+
+    fun resetSelection() { selection = SyncSelection() }
+    fun choose(id: String, draft: Boolean, selected: Boolean) { if (!busy) selection = selection.choose(id, draft, selected) }
+    fun setCategory(id: String, draft: Boolean, category: SyncCategory, selected: Boolean) {
+        if (!busy) selection = selection.setCategory(id, draft, category, selected)
+    }
+    fun selectAllJobs(ids: List<String>) { if (!busy) selection = selection.selectAllJobs(ids) }
+    fun clearJobs() { if (!busy) selection = selection.clearJobs() }
 
     private var scope: CoroutineScope? = null
     private var manager: WifiP2pManager? = null
@@ -160,6 +170,7 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
 
     private fun beginTransfer(info: WifiP2pInfo) {
         val running = scope ?: return
+        val outgoingSelection = selection
         busy = true
         transfer = running.launch {
             status = "Connected. Opening a secure transfer…"
@@ -170,7 +181,7 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
                     } else connectToOwner(info)
                     socket = connected
                     connected.soTimeout = 180_000
-                    connected.use { exchange(it, info.isGroupOwner) }
+                    connected.use { exchange(it, info.isGroupOwner, outgoingSelection) }
                 }
             } catch (_: TimeoutCancellationException) {
                 status = "The code confirmation timed out. Search again on both phones."
@@ -198,14 +209,14 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         error("Could not reach the other phone.")
     }
 
-    private suspend fun exchange(connection: Socket, owner: Boolean) {
+    private suspend fun exchange(connection: Socket, owner: Boolean, outgoingSelection: SyncSelection) {
         val input = DataInputStream(connection.getInputStream().buffered())
         val output = DataOutputStream(connection.getOutputStream().buffered())
         val nonce = ByteArray(16).also { SecureRandom().nextBytes(it) }
-        output.writeUTF("jobtracker-sync-v1")
+        output.writeUTF("jobtracker-sync-v2")
         output.write(nonce)
         output.flush()
-        require(input.readUTF() == "jobtracker-sync-v1") { "The other device is not running JobTracker sync." }
+        require(input.readUTF() == "jobtracker-sync-v2") { "Update Job Tracker on both phones to choose what gets shared." }
         val remoteNonce = ByteArray(16).also(input::readFully)
         val sorted = listOf(nonce, remoteNonce).sortedBy { it.toHex() }
         val digest = MessageDigest.getInstance("SHA-256").digest(sorted[0] + sorted[1])
@@ -214,15 +225,15 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         withContext(Dispatchers.Main) {
             approval = choice
             code = "%06d".format(java.util.Locale.US, number)
-            status = "Compare the code on both phones. Confirm on each phone to transfer jobs, photos, drafts, and private costs."
+            status = "Compare the code on both phones. Confirm on each phone to share the details each phone selected."
         }
         val accepted = withTimeout(120_000) { choice.await() }
         output.writeBoolean(accepted)
         output.flush()
         if (!accepted) error("Transfer canceled")
         require(input.readBoolean()) { "The other phone did not approve the transfer." }
-        withContext(Dispatchers.Main) { code = null; approval = null; status = "Transferring jobs and photos…" }
-        val outgoing = SyncArchive.create(activity, store)
+        withContext(Dispatchers.Main) { code = null; approval = null; status = "Transferring selected details…" }
+        val outgoing = SyncArchive.create(activity, store, outgoingSelection)
         var incoming: File? = null
         try {
             if (owner) {
@@ -236,7 +247,7 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
             withContext(Dispatchers.Main) {
                 result = summary
                 status = "Sync complete. Added ${summary.added}, updated ${summary.updated}, received ${summary.photos} photos and ${summary.costs} cost lists." +
-                    if (summary.draftSkipped) " Both phones have different unfinished drafts; the draft on this phone was kept." else ""
+                    if (summary.draftSkipped) " This phone already has three drafts; extra incoming drafts were kept on the other phone." else ""
             }
         } finally {
             outgoing.delete()

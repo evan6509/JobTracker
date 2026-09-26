@@ -88,12 +88,12 @@ internal fun createJobPdf(context: Context, job: Job): File {
     val pdf = PdfPageWriter()
     pdf.text(job.label, bold = true, size = 20f)
     pdf.text("Job details")
-    pdf.section("Clients", job.clients.joinToString("\n") { it.name + if (it.phone.isBlank()) "" else " · ${it.phone}" })
+    pdf.section("Clients", job.clients.joinToString("\n") { it.name + if (it.phone.isBlank()) "" else " · ${displayPhone(it.phone)}" })
     pdf.section("Job site", job.address)
     pdf.section("Schedule", scheduleSummary(job))
     pdf.section("Work details", job.description)
     pdf.section("Inventory", job.inventory.filter { it.name.isNotBlank() }.joinToString("\n") { "${it.quantity.ifBlank { "1" }} × ${it.name}${if (it.notes.isBlank()) "" else " · ${it.notes}"}" })
-    pdf.section("Outside workers", job.workers.joinToString("\n") { "${it.name}: ${it.work}${if (it.phone.isBlank()) "" else " · ${it.phone}"}" })
+    pdf.section("Outside workers", job.workers.joinToString("\n") { "${it.name}: ${it.work}${if (it.phone.isBlank()) "" else " · ${displayPhone(it.phone)}"}" })
     job.photos.forEachIndexed { index, path -> sampledBitmap(path)?.let { pdf.photo("Reference photo ${index + 1}", it) } }
     return pdf.save(pdfFile(context, "job"))
 }
@@ -111,4 +111,4 @@ internal fun createCostsPdf(context: Context, job: Job, costs: List<CostItem>): 
     return pdf.save(pdfFile(context, "costs"))
 }
 
-private fun BigDecimal.asMoney(): String = "$" + setScale(2, RoundingMode.HALF_UP).toPlainString()
+internal fun BigDecimal.asMoney(): String = "$" + setScale(2, RoundingMode.HALF_UP).toPlainString()

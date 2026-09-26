@@ -13,34 +13,42 @@ import java.util.zip.ZipOutputStream
 
 internal data class SyncResult(val added: Int, val updated: Int, val photos: Int, val costs: Int, val draftSkipped: Boolean)
 
-/** A complete job snapshot. Photo paths are replaced with files inside the archive. */
+/** A selected job snapshot. Fields and photos not chosen by this phone never enter the archive. */
 internal object SyncArchive {
     private const val MAX_ARCHIVE = 1024L * 1024 * 1024
     private const val MAX_PHOTO = 100L * 1024 * 1024
     private const val MAX_MANIFEST = 5L * 1024 * 1024
 
-    fun create(context: Context, store: JobStore): File {
+    fun create(context: Context, store: JobStore, selection: SyncSelection): File {
         val archive = File.createTempFile("jobtracker-send-", ".zip", context.cacheDir)
         try {
-            val manifest = JSONObject().put("format", "jobtracker-sync-v1")
+            val manifest = JSONObject().put("format", "jobtracker-sync-v2")
             val records = JSONArray()
             val photos = mutableListOf<Pair<String, File>>()
-            store.jobs().forEachIndexed { index, job ->
-                val record = JSONObject().put("job", job.toJson(false))
-                record.put("photos", photoEntries(context, job, "photos/jobs/$index", photos))
-                val costs = store.costs(job.id)
-                record.put("costs", JSONArray().apply {
-                    costs.forEach { put(JSONObject().put("description", it.description).put("amount", it.amount)) }
+            store.jobs().filter { selection.jobs[it.id]?.isNotEmpty() == true }.forEachIndexed { index, job ->
+                val categories = selection.jobs.getValue(job.id)
+                records.put(selectedRecord(store, job, categories).apply {
+                    if (SyncCategory.PHOTOS in categories) put("photos", photoEntries(context, job, "photos/jobs/$index", photos))
+                    if (SyncCategory.COSTS in categories) {
+                        val costs = store.costs(job.id)
+                        put("costs", JSONArray().apply {
+                            costs.forEach { put(JSONObject().put("description", it.description).put("amount", it.amount)) }
+                        })
+                        put("costUpdatedAt", store.costsUpdatedAt(job.id).takeIf { it > 0 }
+                            ?: if (costs.isNotEmpty()) job.updatedAt else 0L)
+                    }
                 })
-                record.put("costUpdatedAt", store.costsUpdatedAt(job.id).takeIf { it > 0 } ?: if (costs.isNotEmpty()) job.updatedAt else 0L)
-                records.put(record)
             }
             manifest.put("jobs", records)
-            store.draft()?.let { draft ->
-                manifest.put("draft", JSONObject().put("job", draft.toJson(false))
-                    .put("step", store.draftStep())
-                    .put("photos", photoEntries(context, draft, "photos/draft", photos)))
+            val draftRecords = JSONArray()
+            store.drafts().filter { selection.drafts[it.id]?.isNotEmpty() == true }.forEachIndexed { index, draft ->
+                val categories = selection.drafts.getValue(draft.id) - SyncCategory.COSTS
+                draftRecords.put(selectedRecord(store, draft, categories).apply {
+                    put("step", store.draftStep(draft.id))
+                    if (SyncCategory.PHOTOS in categories) put("photos", photoEntries(context, draft, "photos/drafts/$index", photos))
+                })
             }
+            manifest.put("drafts", draftRecords)
             val json = manifest.toString().toByteArray(Charsets.UTF_8)
             require(json.size <= MAX_MANIFEST) { "Too many jobs to sync at once." }
             ZipOutputStream(FileOutputStream(archive)).use { zip ->
@@ -60,6 +68,18 @@ internal object SyncArchive {
             archive.delete()
             throw error
         }
+    }
+
+    private fun selectedRecord(store: JobStore, job: Job, categories: Set<SyncCategory>): JSONObject {
+        val source = job.toJson(false)
+        val selected = JSONObject().put("id", job.id).put("createdAt", job.createdAt).put("updatedAt", job.updatedAt)
+        categories.forEach { category -> category.fields.forEach { key -> selected.put(key, source.get(key)) } }
+        val stamps = store.fieldStamps(job)
+        return JSONObject().put("job", selected)
+            .put("fields", JSONArray().apply { categories.forEach { put(it.name) } })
+            .put("fieldUpdated", JSONObject().apply { categories.forEach { category ->
+                if (category != SyncCategory.COSTS) put(category.name, stamps.getValue(category))
+            } })
     }
 
     private fun photoEntries(context: Context, job: Job, prefix: String, output: MutableList<Pair<String, File>>): JSONArray {
@@ -94,7 +114,9 @@ internal object SyncArchive {
                     }
                 }
                 val manifest = JSONObject(manifestBytes.toString(Charsets.UTF_8.name()))
-                require(manifest.optString("format") == "jobtracker-sync-v1") { "The other phone has an incompatible sync format." }
+                require(manifest.optString("format") == "jobtracker-sync-v2") {
+                    "Update Job Tracker on both phones to choose what gets shared."
+                }
                 val records = manifest.getJSONArray("jobs")
                 require(records.length() <= 10000) { "Too many jobs in sync data." }
                 val local = store.jobs()
@@ -104,52 +126,142 @@ internal object SyncArchive {
                 var photoCount = 0
                 var costCount = 0
                 val newCosts = mutableListOf<Triple<String, List<CostItem>, Long>>()
+                val fieldStamps = mutableMapOf<String, Map<SyncCategory, Long>>()
+                val seenJobs = mutableSetOf<String>()
                 for (index in 0 until records.length()) {
                     val record = records.getJSONObject(index)
-                    val remote = record.getJSONObject("job").toJob()
-                    require(remote.id.isNotBlank()) { "A transferred job has no ID." }
-                    val position = merged.indexOfFirst { it.id == remote.id }
+                    val id = record.getJSONObject("job").optString("id")
+                    require(id.isNotBlank() && seenJobs.add(id)) { "A transferred job is invalid." }
+                    val position = merged.indexOfFirst { it.id == id }
                     val old = merged.getOrNull(position)
-                    if (old == null || remoteWins(old.updatedAt, remote.updatedAt, old.toJson(false).toString(), remote.toJson(false).toString())) {
-                        val paths = extractPhotos(context, zip, record.optJSONArray("photos"), created)
-                        photoCount += paths.size
-                        val value = remote.copy(photos = paths)
-                        if (position < 0) { merged.add(value); added++ } else { merged[position] = value; updated++ }
+                    val choice = mergeSelectedRecord(context, store, zip, record, old,
+                        (merged.maxOfOrNull { it.priority } ?: -1) + 1, created)
+                    photoCount += choice.photos
+                    fieldStamps[id] = choice.stamps
+                    if (choice.changed) {
+                        if (position < 0) { merged.add(choice.job); added++ } else { merged[position] = choice.job; updated++ }
                     }
-                    val costs = record.optJSONArray("costs")?.let { array ->
-                        (0 until array.length()).map { row -> array.getJSONObject(row).let { CostItem(it.optString("description"), it.optString("amount")) } }
-                    } ?: emptyList()
-                    val remoteStamp = record.optLong("costUpdatedAt", 0L)
-                    val localCosts = store.costs(remote.id)
-                    val localStamp = store.costsUpdatedAt(remote.id).takeIf { it > 0 } ?: if (localCosts.isNotEmpty()) old?.updatedAt ?: 0L else 0L
-                    if (position < 0 || remoteWins(localStamp, remoteStamp, localCosts.toString(), costs.toString())) {
-                        newCosts += Triple(remote.id, costs, remoteStamp)
-                        if (costs.isNotEmpty()) costCount++
+                    if (SyncCategory.COSTS in choice.categories) {
+                        val array = record.getJSONArray("costs")
+                        val costs = (0 until array.length()).map { row -> array.getJSONObject(row).let {
+                            CostItem(it.optString("description"), it.optString("amount"))
+                        } }
+                        val remoteStamp = record.getLong("costUpdatedAt")
+                        val localCosts = store.costs(id)
+                        val localStamp = store.costsUpdatedAt(id).takeIf { it > 0 }
+                            ?: if (localCosts.isNotEmpty()) old?.updatedAt ?: 0L else 0L
+                        if (old == null || remoteWins(localStamp, remoteStamp, localCosts.toString(), costs.toString())) {
+                            newCosts += Triple(id, costs, remoteStamp)
+                            if (costs.isNotEmpty()) costCount++
+                        }
                     }
                 }
-                val draftRecord = manifest.optJSONObject("draft")
-                val localDraft = store.draft()
-                val remoteDraft = draftRecord?.getJSONObject("job")?.toJob()
-                val takeDraft = remoteDraft != null && (localDraft == null ||
-                    (localDraft.id == remoteDraft.id && remoteWins(localDraft.updatedAt, remoteDraft.updatedAt,
-                        localDraft.toJson(false).toString(), remoteDraft.toJson(false).toString())))
-                val newDraft = if (takeDraft) remoteDraft!!.copy(photos = extractPhotos(context, zip, draftRecord!!.optJSONArray("photos"), created)) else null
-                if (newDraft != null) photoCount += newDraft.photos.size
-                val draftSkipped = remoteDraft != null && localDraft != null && localDraft.id != remoteDraft.id
+                val incomingDrafts = manifest.getJSONArray("drafts")
+                require(incomingDrafts.length() <= 3) { "Too many drafts in sync data." }
+                val combinedDrafts = store.drafts().toMutableList()
+                val draftSteps = combinedDrafts.associate { it.id to store.draftStep(it.id) }.toMutableMap()
+                var draftSkipped = false
+                val seenDrafts = mutableSetOf<String>()
+                for (index in 0 until incomingDrafts.length()) {
+                    val record = incomingDrafts.getJSONObject(index)
+                    val id = record.getJSONObject("job").optString("id")
+                    require(id.isNotBlank() && seenDrafts.add(id)) { "A transferred draft is invalid." }
+                    val position = combinedDrafts.indexOfFirst { it.id == id }
+                    val localDraft = combinedDrafts.getOrNull(position)
+                    if (localDraft == null && combinedDrafts.size >= 3) {
+                        draftSkipped = true
+                        continue
+                    }
+                    val choice = mergeSelectedRecord(context, store, zip, record, localDraft, 0, created, draft = true)
+                    photoCount += choice.photos
+                    fieldStamps[id] = choice.stamps
+                    if (choice.changed) {
+                        if (position >= 0) combinedDrafts[position] = choice.job else combinedDrafts.add(choice.job)
+                        draftSteps[id] = record.optInt("step", 0).coerceIn(0, 7)
+                    }
+                }
                 val active = merged.filter { it.state == Job.ACTIVE }.maxWithOrNull(compareBy<Job> { it.updatedAt }.thenBy { it.id })?.id
                 val finalJobs = merged.map { if (it.state == Job.ACTIVE && it.id != active) it.copy(state = Job.PLANNED) else it }
-                store.saveJobs(finalJobs)
+                store.saveJobs(finalJobs, trackChanges = false)
                 newCosts.forEach { (id, costs, stamp) -> store.saveCostsAt(id, costs, stamp) }
-                if (newDraft != null) {
-                    store.saveDraft(newDraft)
-                    store.saveDraftStep(draftRecord!!.optInt("step", 0))
-                }
+                store.saveDrafts(combinedDrafts)
+                fieldStamps.forEach { (id, stamps) -> store.saveFieldStamps(id, stamps) }
+                draftSteps.forEach { (id, step) -> store.saveDraftStep(id, step) }
                 return SyncResult(added, updated, photoCount, costCount, draftSkipped)
             }
         } catch (error: Exception) {
             created.forEach(File::delete)
             throw error
         }
+    }
+
+    private data class SelectedMerge(
+        val job: Job,
+        val stamps: Map<SyncCategory, Long>,
+        val categories: Set<SyncCategory>,
+        val changed: Boolean,
+        val photos: Int
+    )
+
+    private fun mergeSelectedRecord(
+        context: Context, store: JobStore, zip: ZipFile, record: JSONObject, old: Job?,
+        newPriority: Int, created: MutableList<File>, draft: Boolean = false
+    ): SelectedMerge {
+        val array = record.getJSONArray("fields")
+        val categories = (0 until array.length()).map { index ->
+            SyncCategory.entries.firstOrNull { it.name == array.getString(index) }
+                ?: error("Unknown job detail in sync data.")
+        }.toSet()
+        require(categories.isNotEmpty() && (!draft || SyncCategory.COSTS !in categories)) {
+            "Invalid selected job details."
+        }
+        val jobJson = record.getJSONObject("job")
+        require(jobJson.optString("id").isNotBlank()) { "A transferred job is invalid." }
+        categories.forEach { category -> category.fields.forEach { key ->
+            require(jobJson.has(key)) { "A selected job detail is missing." }
+        } }
+        val remote = jobJson.toJob()
+        val remoteStamps = record.getJSONObject("fieldUpdated")
+        val initial = old ?: Job(id = remote.id, createdAt = remote.createdAt,
+            updatedAt = remote.updatedAt, priority = newPriority)
+        var merged = initial
+        val stamps = (old?.let(store::fieldStamps)
+            ?: SyncCategory.entries.filterNot { it == SyncCategory.COSTS }.associateWith { 0L }).toMutableMap()
+        var changed = old == null
+        var photoCount = 0
+        categories.filterNot { it == SyncCategory.COSTS }.forEach { category ->
+            val incomingStamp = remoteStamps.getLong(category.name)
+            require(incomingStamp >= 0) { "Invalid job detail date." }
+            val localStamp = stamps[category] ?: 0L
+            val take = old == null || remoteWins(localStamp, incomingStamp,
+                initial.syncValue(category).toString(), remote.syncValue(category).toString())
+            if (take) {
+                if (category == SyncCategory.PHOTOS) {
+                    val paths = extractPhotos(context, zip, record.getJSONArray("photos"), created)
+                    merged = merged.copy(photos = paths)
+                    photoCount += paths.size
+                } else {
+                    merged = applyCategory(merged, remote, category)
+                }
+                stamps[category] = incomingStamp
+                changed = true
+            }
+        }
+        if (changed) merged = merged.copy(updatedAt = maxOf(initial.updatedAt, remote.updatedAt))
+        return SelectedMerge(merged, stamps, categories, changed, photoCount)
+    }
+
+    private fun applyCategory(base: Job, remote: Job, category: SyncCategory): Job = when (category) {
+        SyncCategory.NAME -> base.copy(title = remote.title)
+        SyncCategory.STATUS -> base.copy(state = remote.state, priority = remote.priority)
+        SyncCategory.CLIENTS -> base.copy(clients = remote.clients)
+        SyncCategory.SITE -> base.copy(address = remote.address)
+        SyncCategory.SCHEDULE -> base.copy(startDate = remote.startDate, startTime = remote.startTime,
+            endDate = remote.endDate, timeZone = remote.timeZone)
+        SyncCategory.WORK -> base.copy(description = remote.description)
+        SyncCategory.INVENTORY -> base.copy(inventory = remote.inventory)
+        SyncCategory.WORKERS -> base.copy(workers = remote.workers)
+        SyncCategory.PHOTOS, SyncCategory.COSTS -> base
     }
 
     private fun extractPhotos(context: Context, zip: ZipFile, names: JSONArray?, created: MutableList<File>): List<String> {
@@ -159,7 +271,7 @@ internal object SyncArchive {
         var total = created.sumOf { it.length() }
         return (0 until names.length()).map { index ->
             val name = names.getString(index)
-            require(Regex("photos/(jobs/[0-9]+|draft)/[0-9]+").matches(name)) { "Invalid photo name." }
+            require(Regex("photos/(jobs/[0-9]+|draft|drafts/[0-9]+)/[0-9]+").matches(name)) { "Invalid photo name." }
             val entry = zip.getEntry(name) ?: error("A transferred photo is missing.")
             require(entry.size in 0..MAX_PHOTO) { "A transferred photo is too large." }
             val file = File.createTempFile("synced_", ".jpg", folder)
