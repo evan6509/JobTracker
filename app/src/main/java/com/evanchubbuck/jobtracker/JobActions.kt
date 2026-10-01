@@ -92,7 +92,7 @@ internal fun scheduleValidationError(job: Job): String? = when {
 
 internal fun startIsPast(job: Job, now: Long = System.currentTimeMillis()): Boolean {
     val startDay = parseDate(job.startDate, job.timeZone) ?: return false
-    if (job.startTime.isNotBlank()) return (parseStart(job) ?: return false) < now
+    if (job.startTime.isNotBlank()) return Math.floorDiv(parseStart(job) ?: return false, 60_000L) < Math.floorDiv(now, 60_000L)
     val today = Calendar.getInstance(TimeZone.getTimeZone(job.timeZone)).apply {
         timeInMillis = now
         set(Calendar.HOUR_OF_DAY, 0)

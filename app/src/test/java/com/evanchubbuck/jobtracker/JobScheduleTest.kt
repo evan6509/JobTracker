@@ -47,6 +47,18 @@ class JobScheduleTest {
         assertEquals(60 * 60_000L, range.end - range.start)
     }
 
+    @Test fun currentMinuteIsNotPastUntilTheNextMinuteStarts() {
+        listOf("America/Chicago", "Asia/Kolkata", "UTC").forEach { jobZone ->
+            val job = Job(startDate = "2026-09-30", startTime = "23:59", timeZone = jobZone)
+            val start = parseStart(job)!!
+            assertFalse(startIsPast(job, start))
+            assertFalse(startIsPast(job, start + 30_123))
+            assertFalse(startIsPast(job, start + 59_999))
+            assertTrue(startIsPast(job, start + 60_000))
+            assertTrue(startIsPast(job.copy(startTime = "23:58"), start + 30_123))
+        }
+    }
+
     @Test fun oldMinuteEstimateUsesItsStartTimeWhenMigrated() {
         assertEquals("2026-09-25", legacyEndDate("2026-09-24", "23:30", "90", zone))
     }
