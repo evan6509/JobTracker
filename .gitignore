@@ -15,3 +15,21 @@
 local.properties
 AGENTS.md
 SPEC.md
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+google-services.json
+service-account*.json
+credentials*.json
+
+# Python release tooling
+__pycache__/
+*.pyc

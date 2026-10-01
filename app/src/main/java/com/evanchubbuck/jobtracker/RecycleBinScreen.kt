@@ -19,7 +19,7 @@ internal fun RecycleBinScreen(entries: List<RecycledJob>, modifier: Modifier,
     LazyColumn(modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Text("Recycle bin", color = UiInk, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-            Text("Deleted jobs and drafts stay here until you restore them or delete them forever. Active jobs return as planned.",
+            Text("Deleted jobs and drafts stay here until you restore them or delete them forever. Active jobs return to planning.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(12.dp))
             if (entries.isEmpty()) Text("The Recycle bin is empty.", color = UiInk)
@@ -43,7 +43,7 @@ internal fun RecycleBinScreen(entries: List<RecycledJob>, modifier: Modifier,
     }
     entries.firstOrNull { it.id == deletingId }?.let { entry ->
         AlertDialog(onDismissRequest = { deletingId = null }, title = { Text("Delete ${entry.job.label} forever?") },
-            text = { Text("This permanently removes it, including its costs and photos that aren't used elsewhere. You can't undo this.") },
+            text = { Text("This permanently removes it, including its materials, prices, and photos that aren't used elsewhere. You can't undo this.") },
             confirmButton = { TextButton(onClick = { onDeleteForever(setOf(entry.id)); deletingId = null }) {
                 Text("Delete forever", color = MaterialTheme.colorScheme.error)
             } }, dismissButton = { TextButton(onClick = { deletingId = null }) { Text("Cancel") } })

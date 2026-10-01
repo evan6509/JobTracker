@@ -81,6 +81,28 @@ internal fun displayPhone(value: String): String {
     }
 }
 
+internal fun scheduleValidationError(job: Job): String? = when {
+    job.startDate.isNotBlank() && parseDate(job.startDate, job.timeZone) == null -> "Choose a valid start date."
+    job.endDate.isNotBlank() && parseDate(job.endDate, job.timeZone) == null -> "Choose a valid end date."
+    job.startTime.isNotBlank() && (job.startDate.isBlank() || parseStart(job) == null) -> "Set a start date and choose a valid time."
+    job.endDate.isNotBlank() && job.startDate.isBlank() -> "Choose a start date before the end date."
+    job.startDate.isNotBlank() && job.endDate.isNotBlank() && parseDate(job.endDate, job.timeZone)!! < parseDate(job.startDate, job.timeZone)!! -> "End date must be on or after the start date."
+    else -> null
+}
+
+internal fun startIsPast(job: Job, now: Long = System.currentTimeMillis()): Boolean {
+    val startDay = parseDate(job.startDate, job.timeZone) ?: return false
+    if (job.startTime.isNotBlank()) return Math.floorDiv(parseStart(job) ?: return false, 60_000L) < Math.floorDiv(now, 60_000L)
+    val today = Calendar.getInstance(TimeZone.getTimeZone(job.timeZone)).apply {
+        timeInMillis = now
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }.timeInMillis
+    return startDay < today
+}
+
 internal fun validationError(job: Job): String? = when {
     job.clients.none { it.name.isNotBlank() } -> "Enter at least one client name."
     job.clients.any { it.name.isBlank() && it.phone.isNotBlank() } -> "Enter a name for every client with a phone number."
@@ -88,12 +110,9 @@ internal fun validationError(job: Job): String? = when {
     job.workers.any { it.name.isBlank() && (it.phone.isNotBlank() || it.work.isNotBlank()) } -> "Enter a name for each outside worker."
     job.workers.any { it.name.isNotBlank() && it.work.isBlank() } -> "Enter assigned work for each outside worker."
     job.workers.any { !validPhone(it.phone) } -> "Check the worker phone numbers."
-    job.startDate.isNotBlank() && parseDate(job.startDate, job.timeZone) == null -> "Choose a valid start date."
-    job.endDate.isNotBlank() && parseDate(job.endDate, job.timeZone) == null -> "Choose a valid end date."
-    job.startTime.isNotBlank() && (job.startDate.isBlank() || parseStart(job) == null) -> "Set a start date and a valid time, such as 09:30."
-    job.endDate.isNotBlank() && job.startDate.isBlank() -> "Choose a start date before the end date."
-    job.startDate.isNotBlank() && job.endDate.isNotBlank() && parseDate(job.endDate, job.timeZone)!! < parseDate(job.startDate, job.timeZone)!! -> "End date must be on or after the start date."
-    job.inventory.any { it.name.isBlank() && (it.quantity.isNotBlank() || it.notes.isNotBlank()) } -> "Name every inventory item you add."
+    scheduleValidationError(job) != null -> scheduleValidationError(job)
+    job.inventory.any { it.name.isBlank() && (it.quantity.isNotBlank() || it.notes.isNotBlank() || it.price.isNotBlank()) } -> "Name every material you add."
+    job.inventory.any { !validMaterialPrice(it.price) } -> "Enter material prices of zero or more, with up to two decimal places."
     else -> null
 }
 
@@ -111,11 +130,11 @@ internal fun displayDate(value: String, zone: String): String = parseDate(value,
     SimpleDateFormat("MMMM d, yyyy", Locale.US).apply { timeZone = TimeZone.getTimeZone(zone) }.format(Date(it))
 } ?: value
 
-internal fun scheduleSummary(job: Job): String = when {
+internal fun scheduleSummary(job: Job, timeFormat: JobTimeFormat = JobTimeFormat()): String = when {
     job.startDate.isBlank() -> "Date not set"
-    job.endDate.isBlank() -> displayDate(job.startDate, job.timeZone) + if (job.startTime.isBlank()) "" else " at ${job.startTime}"
-    job.startDate == job.endDate -> displayDate(job.startDate, job.timeZone) + if (job.startTime.isBlank()) "" else " at ${job.startTime}"
-    else -> "${displayDate(job.startDate, job.timeZone)} – ${displayDate(job.endDate, job.timeZone)}" + if (job.startTime.isBlank()) "" else " · starts ${job.startTime}"
+    job.endDate.isBlank() -> displayDate(job.startDate, job.timeZone) + if (job.startTime.isBlank()) "" else " at ${displayTime(job.startTime, timeFormat)}"
+    job.startDate == job.endDate -> displayDate(job.startDate, job.timeZone) + if (job.startTime.isBlank()) "" else " at ${displayTime(job.startTime, timeFormat)}"
+    else -> "${displayDate(job.startDate, job.timeZone)} – ${displayDate(job.endDate, job.timeZone)}" + if (job.startTime.isBlank()) "" else " · starts ${displayTime(job.startTime, timeFormat)}"
 }
 
 internal fun parseStart(job: Job): Long? {
@@ -156,10 +175,10 @@ internal fun legacyEndDate(startDate: String, startTime: String, durationMinutes
         .format(Date(start + minutes * 60_000L))
 }
 
-internal fun sharePayload(job: Job): String = JSONObject().apply {
+internal fun sharePayload(job: Job, includePrices: Boolean = false): String = JSONObject().apply {
     put("format", "jobtracker-v1")
-    put("source", "${job.id}:${job.updatedAt}")
-    val snapshot = job.copy(inventory = job.inventory.filter { it.name.isNotBlank() }).toJson(includeLocalPhotos = false)
+    put("source", "${job.id}:${job.updatedAt}${if (includePrices) ":prices" else ""}")
+    val snapshot = job.copy(inventory = job.inventory.filter { it.name.isNotBlank() }).toJson(includeLocalPhotos = false, includePrices = includePrices)
     listOf("id", "state", "priority", "createdAt", "updatedAt", "importedSource").forEach(snapshot::remove)
     put("job", snapshot)
 }.toString()

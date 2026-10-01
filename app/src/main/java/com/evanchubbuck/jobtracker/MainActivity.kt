@@ -70,8 +70,10 @@ class MainActivity : ComponentActivity() {
                     isAppearanceLightNavigationBars = !darkMode
                 }
             }
-            JobTrackerTheme(darkTheme = darkMode) {
-                JobTrackerApp(darkMode) { enabled -> darkMode = enabled; prefs.edit().putBoolean("dark_mode", enabled).apply() }
+            PhoneTimeFormat {
+                JobTrackerTheme(darkTheme = darkMode) {
+                    JobTrackerApp(darkMode) { enabled -> darkMode = enabled; prefs.edit().putBoolean("dark_mode", enabled).apply() }
+                }
             }
         }
     }
@@ -80,6 +82,7 @@ class MainActivity : ComponentActivity() {
     private fun JobTrackerApp(darkMode: Boolean, onDarkMode: (Boolean) -> Unit) {
         val store = remember { JobStore(this) }
         val settings = remember { getSharedPreferences("job_tracker_settings", MODE_PRIVATE) }
+        var companyName by remember { mutableStateOf(settings.getString("company_name", "").orEmpty()) }
         var qrSharing by remember { mutableStateOf(settings.getBoolean("share_qr", true)) }
         var pdfSharing by remember { mutableStateOf(settings.getBoolean("share_pdf", true)) }
         var instantDeleteOnLongSwipe by remember { mutableStateOf(settings.getBoolean("instant_draft_delete", false)) }
@@ -118,8 +121,8 @@ class MainActivity : ComponentActivity() {
         var pdfPath by rememberSaveable { mutableStateOf("") }
         var pdfSubject by rememberSaveable { mutableStateOf("") }
         var pdfReturnScreen by rememberSaveable { mutableStateOf("detail") }
+        var pdfOptions by rememberSaveable(stateSaver = JobPdfOptionsSaver) { mutableStateOf(JobPdfOptions()) }
         var creatingPdf by remember { mutableStateOf(false) }
-        var costs by remember { mutableStateOf<List<CostItem>>(emptyList()) }
         var scanRaw by rememberSaveable { mutableStateOf("") }
         var checkingUpdate by remember { mutableStateOf(false) }
         var latestRelease by remember { mutableStateOf<GitHubRelease?>(null) }
@@ -158,7 +161,6 @@ class MainActivity : ComponentActivity() {
             if (sync.result != null) {
                 jobs = store.jobs()
                 drafts = store.drafts()
-                costs = store.costs(selectedId)
             }
         }
 
@@ -235,12 +237,14 @@ class MainActivity : ComponentActivity() {
         fun setState(id: String, state: String) {
             persist(changeJobState(jobs, id, state))
         }
+        fun closeEditor() {
+            editor = null
+            screen = if (editingId.isBlank()) "drafts" else "detail"
+        }
         fun back() {
             when (screen) {
-                "editor" -> if (editingId.isNotBlank() && step == 6) { screen = "detail"; editor = null }
-                    else if (step > 0) { step--; if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step); error = "" }
-                    else { screen = if (editingId.isBlank()) "drafts" else "detail"; editor = null }
-                "share", "costs" -> screen = "detail"
+                "editor" -> closeEditor()
+                "share", "client_pdf" -> screen = "detail"
                 "recycle_bin" -> screen = "settings"
                 "pdf" -> { screen = pdfReturnScreen; pdfPath = ""; pdfSubject = "" }
                 else -> screen = "home"
@@ -276,24 +280,26 @@ class MainActivity : ComponentActivity() {
                 launch(Intent.createChooser(intent, "Send PDF"), "No app is available to send the PDF.")
             } catch (_: Exception) { message = "Could not share the PDF. Try again." }
         }
-        fun previewPdf(job: Job, costExport: Boolean) {
+        fun previewPdf(job: Job, options: JobPdfOptions = JobPdfOptions.forJob(job)) {
             if (creatingPdf) return
             val returnScreen = screen
-            val exportCosts = costs
+            val exportCompanyName = companyName.trim()
             creatingPdf = true
             scope.launch {
                 try {
                     val file = withContext(Dispatchers.IO) {
-                        if (costExport) createCostsPdf(this@MainActivity, job, exportCosts) else createJobPdf(this@MainActivity, job)
+                        createJobPdf(this@MainActivity, job, options, exportCompanyName)
                     }
                     if (screen == returnScreen && selectedId == job.id) {
                         pdfPath = file.absolutePath
-                        pdfSubject = if (costExport) "${job.label} costs" else job.label
+                        pdfSubject = "${clientPdfTitle(job, options)} - Job summary"
                         pdfReturnScreen = returnScreen
                         screen = "pdf"
                     } else file.delete()
                 } catch (error: CancellationException) {
                     throw error
+                } catch (_: PdfPhotoUnavailableException) {
+                    message = "A selected photo is unavailable. Uncheck it and try again."
                 } catch (_: Exception) { message = "Could not create the PDF. Try again." }
                 finally { creatingPdf = false }
             }
@@ -404,16 +410,36 @@ class MainActivity : ComponentActivity() {
                         IconButton(onClick = { screen = "history" }) {
                             Icon(painterResource(R.drawable.ic_history), contentDescription = "History", tint = UiCanvas)
                         }
+                    } else if (screen == "editor") {
+                        IconButton(onClick = { back() }) {
+                            Icon(painterResource(R.drawable.ic_arrow_back), contentDescription = "Back", tint = UiCanvas)
+                        }
+                        Text(if (editingId.isBlank()) "Create job" else "Edit job", color = UiCanvas,
+                            style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f))
+                        TextButton(onClick = { closeEditor() }) {
+                            Text(if (editingId.isBlank()) "Save & exit" else "Close", color = UiCanvas)
+                        }
                     } else {
                         TextButton(onClick = { back() }) { Text("‹ Back", color = UiCanvas) }
+                        Spacer(Modifier.weight(1f))
+                        if (screen == "detail") {
+                            val job = jobs.firstOrNull { it.id == selectedId }
+                            if (job != null && calendarRange(job) != null) {
+                                IconButton(onClick = { calendar(job) }) {
+                                    Icon(painterResource(R.drawable.ic_calendar_add),
+                                        contentDescription = "Add to calendar", tint = UiCanvas)
+                                }
+                            }
+                        }
                     }
                 }
             }
         }) { padding ->
-            val area = Modifier.fillMaxSize().padding(padding)
+            val area = Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()
             when (screen) {
                 "home" -> HomeScreen(jobs, drafts.size, area, onNew = { openEditor() }, onDrafts = { screen = "drafts" },
-                    onOpen = { selectedId = it; screen = "detail" }, onScan = { scan() },
+                    onOpen = { selectedId = it; screen = "detail" }, onNavigate = { navigate(it) }, onScan = { scan() },
                     onSync = { sync.resetSelection(); screen = "sync" },
                     onReorder = { from, to ->
                         persist(reorderVisibleJobs(jobs, from, to))
@@ -436,10 +462,15 @@ class MainActivity : ComponentActivity() {
                     }, instantDeleteOnLongSwipe, { enabled ->
                         instantDeleteOnLongSwipe = enabled
                         settings.edit().putBoolean("instant_draft_delete", enabled).apply()
-                    }, installedVersion, area, onRecycleBin = { recycled = store.recycled(); screen = "recycle_bin" })
+                    }, installedVersion, area, onRecycleBin = { recycled = store.recycled(); screen = "recycle_bin" },
+                    companyName = companyName, onCompanyName = { value ->
+                        companyName = value
+                        settings.edit().putString("company_name", value).apply()
+                    })
                 "recycle_bin" -> RecycleBinScreen(recycled, area, onRestore = { restoreRecycled(it) },
                     onDeleteForever = { deleteRecycledForever(it) })
-                "history" -> HistoryScreen(jobs.filter { it.state == Job.COMPLETED }, area) { selectedId = it; screen = "detail" }
+                "history" -> HistoryScreen(jobs.filter { it.state == Job.COMPLETED }, area,
+                    onOpen = { selectedId = it; screen = "detail" }, onNavigate = { navigate(it) })
                 "sync" -> SyncScreen(sync, jobs, drafts, nearbyAllowed && networkAllowed, {
                     nearbyRequest.launch(if (Build.VERSION.SDK_INT in 31..32)
                         arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
@@ -448,26 +479,26 @@ class MainActivity : ComponentActivity() {
                     else arrayOf(nearbyPermission))
                 }, area)
                 "detail" -> jobs.firstOrNull { it.id == selectedId }?.let { job ->
-                    DetailScreen(job, area, onEdit = { openEditor(job.id, it) }, onNavigate = { navigate(job.address) },
-                        onCalendar = { calendar(job) }, onCall = { phone -> launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")), "No phone app is available.") },
-                        onPhoto = { photoPath = it }, onShare = { screen = "share" }, onPdf = { previewPdf(job, false) },
+                    DetailScreen(job, area, onEdit = { openEditor(job.id, it) },
+                        onCall = { phone -> launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")), "No phone app is available.") },
+                        onPhoto = { photoPath = it }, onShare = { screen = "share" }, onPdf = {
+                            pdfOptions = JobPdfOptions.forJob(job); screen = "client_pdf"
+                        },
                         qrSharing = qrSharing, pdfSharing = pdfSharing,
-                        onCosts = { costs = store.costs(job.id); screen = "costs" },
                         onActivate = { if (jobs.any { it.state == Job.ACTIVE && it.id != job.id }) activateId = job.id else setState(job.id, Job.ACTIVE) },
                         onPlan = { setState(job.id, Job.PLANNED) }, onComplete = { completeId = job.id })
                 }
                 "editor" -> {
                     val current = editor ?: if (editingId.isBlank()) drafts.firstOrNull { it.id == activeDraftId } else jobs.firstOrNull { it.id == editingId }
                     if (current != null) EditorScreen(current, step, editingId.isNotBlank(), error, area,
-                        onChange = { changeEditor(it); error = "" }, onStep = { step = it; if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step); error = "" }, onBack = { back() },
-                        onExit = { editor = null; screen = if (editingId.isBlank()) "drafts" else "detail" },
+                        onChange = { changeEditor(it); error = "" }, onStep = { step = it; if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step); error = "" },
                         onPickPhotos = { picker.launch("image/*") }, onPhoto = { photoPath = it },
                         onTakePhoto = { cameraJobId = current.id; photoCamera.launch(Intent(this@MainActivity, PhotoCaptureActivity::class.java)) },
                         onRemovePhoto = { path ->
                             changeEditor(current.copy(photos = current.photos - path))
                             val usedPhotos = jobs.flatMap { it.photos }.toSet() + drafts.flatMap { it.photos }
                             deleteUnusedPhotos(listOf(path), usedPhotos)
-                        }, onNavigate = { navigate(current.address) }, onCalendar = { calendar(current) },
+                        }, onNavigate = { navigate(current.address) },
                         onFinish = {
                             val problem = validationError(current)
                             if (problem != null) {
@@ -475,7 +506,7 @@ class MainActivity : ComponentActivity() {
                                 step = when {
                                     current.clients.none { it.name.isNotBlank() } || current.clients.any { !validPhone(it.phone) || (it.name.isBlank() && it.phone.isNotBlank()) } -> 0
                                     current.workers.any { !validPhone(it.phone) || (it.name.isBlank() && (it.phone.isNotBlank() || it.work.isNotBlank())) || (it.name.isNotBlank() && it.work.isBlank()) } -> 5
-                                    current.inventory.any { it.name.isBlank() && (it.quantity.isNotBlank() || it.notes.isNotBlank()) } -> 4
+                                    current.inventory.any { !validMaterialPrice(it.price) || (it.name.isBlank() && (it.quantity.isNotBlank() || it.notes.isNotBlank() || it.price.isNotBlank())) } -> 4
                                     else -> 2
                                 }
                                 if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step)
@@ -495,8 +526,10 @@ class MainActivity : ComponentActivity() {
                         })
                 }
                 "share" -> jobs.firstOrNull { it.id == selectedId }?.let { ShareScreen(it, area) }
-                "costs" -> jobs.firstOrNull { it.id == selectedId }?.let { job -> CostsScreen(job, costs, area,
-                    onChange = { costs = it; store.saveCosts(job.id, it) }, onExport = { previewPdf(job, true) }) }
+                "client_pdf" -> jobs.firstOrNull { it.id == selectedId }?.let { job ->
+                    JobPdfOptionsScreen(job, pdfOptions, area, creatingPdf,
+                        onChange = { pdfOptions = it }, onPreview = { previewPdf(job, pdfOptions) })
+                }
                 "pdf" -> PdfPreviewScreen(File(pdfPath), pdfSubject, area, onShare = { sharePdf(File(pdfPath), pdfSubject) })
                 "preview" -> scanPreview?.let { incoming -> PreviewScreen(incoming, jobs.any { it.importedSource == scanSource }, area,
                     onCancel = { scanRaw = ""; screen = "home" }, onImport = {
@@ -523,7 +556,7 @@ class MainActivity : ComponentActivity() {
             dismissButton = { TextButton(onClick = { deleteDraftId = null }) { Text("Cancel") } }) }
         if (clearAllData) AlertDialog(onDismissRequest = { clearAllData = false },
             title = { Text("Clear all JobTracker data?") },
-            text = { Text("This erases all jobs, drafts, the Recycle bin, photos saved in JobTracker, private costs, settings, and app permissions on this phone. Copies exported elsewhere remain. The app will close.") },
+            text = { Text("This erases all jobs, drafts, the Recycle bin, photos saved in JobTracker, material prices, settings, and app permissions on this phone. Copies exported elsewhere remain. The app will close.") },
             confirmButton = { TextButton(onClick = {
                 clearAllData = false
                 val cleared = runCatching {
@@ -538,7 +571,7 @@ class MainActivity : ComponentActivity() {
             dismissButton = { TextButton(onClick = { completeId = null }) { Text("Cancel") } }) }
         deleteJobId?.let { id -> AlertDialog(onDismissRequest = { deleteJobId = null },
             title = { Text("Delete ${jobs.firstOrNull { it.id == id }?.label ?: "job"}?") },
-            text = { Text("This moves the job, its costs, and photos to the Recycle bin in Settings. You can restore it later.") },
+            text = { Text("This moves the job, its materials, prices, and photos to the Recycle bin in Settings. You can restore it later.") },
             confirmButton = { TextButton(onClick = { deleteSavedJob(id); deleteJobId = null }) { Text("Delete", color = MaterialTheme.colorScheme.error) } },
             dismissButton = { TextButton(onClick = { deleteJobId = null }) { Text("Cancel") } }) }
         photoPath?.let { path -> AlertDialog(onDismissRequest = { photoPath = null },

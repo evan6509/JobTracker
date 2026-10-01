@@ -7,8 +7,15 @@ import org.json.JSONObject
 import java.util.UUID
 
 data class Person(val name: String = "", val phone: String = "", val work: String = "")
-data class InventoryItem(val name: String = "", val quantity: String = "", val notes: String = "")
-data class CostItem(val description: String = "", val amount: String = "")
+data class InventoryItem(
+    val name: String = "", val quantity: String = "", val notes: String = "",
+    val price: String = "", val id: String = UUID.randomUUID().toString()
+)
+// Used only to read expenses saved by older app versions.
+private data class LegacyCost(val description: String = "", val amount: String = "", val name: String = "")
+
+private fun JSONObject.toLegacyCost(): LegacyCost = LegacyCost(
+    description = optString("description"), amount = optString("amount"), name = optString("name"))
 
 data class Job(
     val id: String = UUID.randomUUID().toString(),
@@ -41,6 +48,62 @@ data class Job(
 class JobStore(context: Context) {
     private val prefs = context.getSharedPreferences("job_tracker", Context.MODE_PRIVATE)
 
+    init { migrateMaterials() }
+
+    /** Move old expense rows into materials atomically; keep every row and its original amount. */
+    private fun migrateMaterials() {
+        if (prefs.getInt("materials_schema", 0) >= 1) return
+        val editor = prefs.edit()
+        fun migrate(jobJson: JSONObject, costs: JSONArray, costStamp: Long, stamps: JSONObject): JSONObject {
+            val id = jobJson.getString("id")
+            val materials = jobJson.optJSONArray("inventory") ?: JSONArray()
+            for (index in 0 until costs.length()) {
+                val cost = costs.getJSONObject(index).toLegacyCost()
+                materials.put(JSONObject().put("id", legacyMaterialId(id, "expense", index))
+                    .put("name", cost.name.ifBlank { cost.description.ifBlank { "Material" } })
+                    .put("quantity", "").put("notes", if (cost.name.isNotBlank() && cost.name != cost.description) cost.description else "")
+                    .put("price", cost.amount))
+            }
+            jobJson.put("inventory", materials)
+            if (costs.length() > 0) {
+                val time = maxOf(costStamp, jobJson.optLong("updatedAt"))
+                stamps.put(SyncCategory.INVENTORY.name, maxOf(time, stamps.optLong(SyncCategory.INVENTORY.name)))
+                stamps.put(SyncCategory.COSTS.name, maxOf(time, stamps.optLong(SyncCategory.COSTS.name)))
+                jobJson.put("updatedAt", time)
+            }
+            return jobJson
+        }
+        fun migrateLive(job: JSONObject): JSONObject {
+            val id = job.getString("id")
+            val oldStamps = prefs.getString("field_updated_$id", null)?.let(::JSONObject)
+                ?: JSONObject().apply { SyncCategory.entries.forEach { put(it.name, job.optLong("updatedAt")) } }
+            migrate(job, JSONArray(prefs.getString("costs_$id", "[]")), prefs.getLong("costs_updated_$id", 0), oldStamps)
+            editor.putString("field_updated_$id", oldStamps.toString()).remove("costs_$id").remove("costs_updated_$id")
+            return job
+        }
+        for (key in listOf("jobs", "drafts")) {
+            if (prefs.contains(key)) {
+                val array = JSONArray(prefs.getString(key, "[]"))
+                for (index in 0 until array.length()) migrateLive(array.getJSONObject(index))
+                editor.putString(key, array.toString())
+            }
+        }
+        prefs.getString("draft", null)?.let { editor.putString("draft", migrateLive(JSONObject(it)).toString()) }
+        if (prefs.contains("recycle_bin")) {
+            val bin = JSONArray(prefs.getString("recycle_bin", "[]"))
+            for (index in 0 until bin.length()) {
+                val entry = bin.getJSONObject(index)
+                val stamps = entry.optJSONObject("fieldUpdated") ?: JSONObject()
+                migrate(entry.getJSONObject("job"), entry.optJSONArray("costs") ?: JSONArray(),
+                    entry.optLong("costUpdatedAt"), stamps)
+                entry.put("fieldUpdated", stamps).remove("costs")
+                entry.remove("costUpdatedAt")
+            }
+            editor.putString("recycle_bin", bin.toString())
+        }
+        check(editor.putInt("materials_schema", 1).commit()) { "Could not save materials. Please reopen Job Tracker." }
+    }
+
     fun jobs(): List<Job> = readArray("jobs").mapNotNull { runCatching { it.toJob() }.getOrNull() }
     internal fun recycled(): List<RecycledJob> = readArray("recycle_bin").mapNotNull {
         runCatching { it.toRecycledJob() }.getOrNull()
@@ -51,7 +114,6 @@ class JobStore(context: Context) {
         val current = if (draft) drafts() else jobs()
         val job = current.firstOrNull { it.id == id } ?: return false
         val entry = RecycledJob(job, draft, step = if (draft) draftStep(id) else 0,
-            costs = if (draft) emptyList() else costs(id), costUpdatedAt = if (draft) 0L else costsUpdatedAt(id),
             fieldStamps = fieldStamps(job))
         val editor = prefs.edit().putString("recycle_bin", recycleJson(recycled() + entry))
         if (draft) {
@@ -59,7 +121,6 @@ class JobStore(context: Context) {
             editor.remove("draft_step_$id")
         } else {
             editor.putString("jobs", jobsJson(current.filterNot { it.id == id }))
-                .remove("costs_$id").remove("costs_updated_$id")
         }
         editor.apply()
         return true
@@ -77,7 +138,7 @@ class JobStore(context: Context) {
             priority = (liveJobs.maxOfOrNull { it.priority } ?: -1) + 1,
             updatedAt = System.currentTimeMillis())
         val stamps = entry.fieldStamps.ifEmpty { fieldStamps(entry.job) }.toMutableMap()
-        SyncCategory.entries.filterNot { it == SyncCategory.COSTS }.forEach { category ->
+        SyncCategory.entries.forEach { category ->
             if (entry.job.syncValue(category) != restored.syncValue(category)) stamps[category] = restored.updatedAt
         }
         val editor = prefs.edit().putString("recycle_bin", recycleJson(bin.filterNot { it.id == entryId }))
@@ -89,9 +150,6 @@ class JobStore(context: Context) {
             editor.putInt("draft_step_${restored.id}", entry.step)
         } else {
             editor.putString("jobs", jobsJson(liveJobs + restored))
-                .putString("costs_${restored.id}", JSONArray().apply { entry.costs.forEach {
-                    put(JSONObject().put("description", it.description).put("amount", it.amount))
-                } }.toString()).putLong("costs_updated_${restored.id}", entry.costUpdatedAt)
         }
         editor.apply()
         return RecycleRestoreResult.RESTORED
@@ -123,26 +181,6 @@ class JobStore(context: Context) {
 
     fun saveDraftStep(id: String, step: Int) {
         prefs.edit().putInt("draft_step_$id", step.coerceIn(0, 7)).apply()
-    }
-
-    fun costs(jobId: String): List<CostItem> = runCatching {
-        val array = JSONArray(prefs.getString("costs_$jobId", "[]"))
-        (0 until array.length()).mapNotNull { array.optJSONObject(it)?.let { row -> CostItem(row.optString("description"), row.optString("amount")) } }
-    }.getOrDefault(emptyList())
-
-    fun costsUpdatedAt(jobId: String): Long = prefs.getLong("costs_updated_$jobId", 0L)
-
-    fun saveCosts(jobId: String, items: List<CostItem>) {
-        saveCostsAt(jobId, items, System.currentTimeMillis())
-    }
-
-    fun saveCostsAt(jobId: String, items: List<CostItem>, updatedAt: Long) {
-        val array = JSONArray().apply { items.forEach { put(JSONObject().put("description", it.description).put("amount", it.amount)) } }
-        prefs.edit().putString("costs_$jobId", array.toString()).putLong("costs_updated_$jobId", updatedAt).apply()
-    }
-
-    fun deleteCosts(jobId: String) {
-        prefs.edit().remove("costs_$jobId").remove("costs_updated_$jobId").apply()
     }
 
     fun saveDraft(job: Job) {
@@ -186,14 +224,14 @@ class JobStore(context: Context) {
 
     internal fun fieldStamps(job: Job): Map<SyncCategory, Long> {
         val saved = runCatching { prefs.getString("field_updated_${job.id}", null)?.let(::JSONObject) }.getOrNull()
-        return SyncCategory.entries.filterNot { it == SyncCategory.COSTS }.associateWith { category ->
+        return SyncCategory.entries.associateWith { category ->
             if (saved == null) job.updatedAt else saved.optLong(category.name, 0L)
         }
     }
 
     internal fun saveFieldStamps(id: String, stamps: Map<SyncCategory, Long>) {
         val json = JSONObject().apply { stamps.forEach { (category, time) ->
-            if (category != SyncCategory.COSTS) put(category.name, time)
+            put(category.name, time)
         } }
         prefs.edit().putString("field_updated_$id", json.toString()).apply()
     }
@@ -201,7 +239,7 @@ class JobStore(context: Context) {
     private fun recordChangedFields(old: Job?, updated: Job) {
         val stamps = old?.let(::fieldStamps).orEmpty().toMutableMap()
         var changed = old == null
-        SyncCategory.entries.filterNot { it == SyncCategory.COSTS }.forEach { category ->
+        SyncCategory.entries.forEach { category ->
             if (old == null || old.syncValue(category) != updated.syncValue(category)) {
                 stamps[category] = updated.updatedAt
                 changed = true
@@ -218,10 +256,18 @@ class JobStore(context: Context) {
 
 private fun Person.toJson() = JSONObject().put("name", name).put("phone", phone).put("work", work)
 private fun JSONObject.toPerson() = Person(optString("name"), optString("phone"), optString("work"))
-private fun InventoryItem.toJson() = JSONObject().put("name", name).put("quantity", quantity).put("notes", notes)
-private fun JSONObject.toInventoryItem() = InventoryItem(optString("name"), optString("quantity"), optString("notes"))
+internal fun legacyMaterialId(jobId: String, kind: String, index: Int): String =
+    UUID.nameUUIDFromBytes("$jobId:$kind:$index".toByteArray(Charsets.UTF_8)).toString()
 
-fun Job.toJson(includeLocalPhotos: Boolean = true) = JSONObject().apply {
+private fun InventoryItem.toJson(includePrices: Boolean) = JSONObject()
+    .put("id", id).put("name", name).put("quantity", quantity).put("notes", notes).apply {
+        if (includePrices) put("price", price)
+    }
+private fun JSONObject.toInventoryItem(jobId: String, index: Int) = InventoryItem(
+    optString("name"), optString("quantity"), optString("notes"), optString("price"),
+    optString("id").ifBlank { legacyMaterialId(jobId, "material", index) })
+
+fun Job.toJson(includeLocalPhotos: Boolean = true, includePrices: Boolean = true) = JSONObject().apply {
     put("id", id)
     put("title", title)
     put("state", state)
@@ -235,13 +281,14 @@ fun Job.toJson(includeLocalPhotos: Boolean = true) = JSONObject().apply {
     put("endDate", endDate)
     put("timeZone", timeZone)
     put("description", description)
-    put("inventory", JSONArray().apply { inventory.forEach { put(it.toJson()) } })
+    put("inventory", JSONArray().apply { inventory.forEach { put(it.toJson(includePrices)) } })
     put("workers", JSONArray().apply { workers.forEach { put(it.toJson()) } })
     if (includeLocalPhotos) put("photos", JSONArray().apply { photos.forEach { put(it) } })
     put("importedSource", importedSource)
 }
 
 fun JSONObject.toJob(): Job {
+    val jobId = optString("id").ifBlank { UUID.randomUUID().toString() }
     fun people(key: String): List<Person> {
         val array = optJSONArray(key) ?: return emptyList()
         return (0 until array.length()).mapNotNull { array.optJSONObject(it)?.toPerson() }
@@ -251,7 +298,7 @@ fun JSONObject.toJob(): Job {
         return (0 until array.length()).map { array.optString(it) }.filter { it.isNotBlank() }
     }
     return Job(
-        id = optString("id").ifBlank { UUID.randomUUID().toString() },
+        id = jobId,
         title = optString("title"),
         state = optString("state", Job.PLANNED),
         priority = optInt("priority"),
@@ -269,7 +316,7 @@ fun JSONObject.toJob(): Job {
                 listOf(existing, "Previous estimate: $oldDuration minutes (choose dates to replace it).").filter { it.isNotBlank() }.joinToString("\n")
             else existing
         },
-        inventory = (optJSONArray("inventory") ?: JSONArray()).let { array -> (0 until array.length()).mapNotNull { array.optJSONObject(it)?.toInventoryItem() } },
+        inventory = (optJSONArray("inventory") ?: JSONArray()).let { array -> (0 until array.length()).mapNotNull { array.optJSONObject(it)?.toInventoryItem(jobId, it) } },
         workers = people("workers"),
         photos = strings("photos"),
         importedSource = optString("importedSource")

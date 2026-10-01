@@ -7,10 +7,10 @@ internal enum class SyncCategory(val label: String, val fields: List<String>) {
     SITE("Job site", listOf("address")),
     SCHEDULE("Schedule", listOf("startDate", "startTime", "endDate", "timeZone")),
     WORK("Work details", listOf("description")),
-    INVENTORY("Inventory", listOf("inventory")),
+    INVENTORY("Materials", listOf("inventory")),
     WORKERS("Outside workers", listOf("workers")),
     PHOTOS("Photos", emptyList()),
-    COSTS("Private costs", emptyList());
+    COSTS("Prices", listOf("materialPrices"));
 
     companion object {
         val jobDefaults: Set<SyncCategory> = entries.filterNot { it == COSTS }.toSet()
@@ -35,7 +35,9 @@ internal data class SyncSelection(
 
     fun setCategory(id: String, draft: Boolean, category: SyncCategory, selected: Boolean): SyncSelection {
         val source = if (draft) drafts else jobs
-        val changedCategories = if (selected) source[id].orEmpty() + category else source[id].orEmpty() - category
+        var changedCategories = if (selected) source[id].orEmpty() + category else source[id].orEmpty() - category
+        if (category == SyncCategory.COSTS && selected) changedCategories = changedCategories + SyncCategory.INVENTORY
+        if (category == SyncCategory.INVENTORY && !selected) changedCategories = changedCategories - SyncCategory.COSTS
         val changed = if (changedCategories.isEmpty()) source - id else source + (id to changedCategories)
         return if (draft) copy(drafts = changed) else copy(jobs = changed)
     }
@@ -51,8 +53,8 @@ internal fun Job.syncValue(category: SyncCategory): Any = when (category) {
     SyncCategory.SITE -> address
     SyncCategory.SCHEDULE -> listOf(startDate, startTime, endDate, timeZone)
     SyncCategory.WORK -> description
-    SyncCategory.INVENTORY -> inventory
+    SyncCategory.INVENTORY -> inventory.map { it.copy(price = "") }
     SyncCategory.WORKERS -> workers
     SyncCategory.PHOTOS -> photos
-    SyncCategory.COSTS -> Unit
+    SyncCategory.COSTS -> inventory.associate { it.id to it.price }.toSortedMap()
 }
