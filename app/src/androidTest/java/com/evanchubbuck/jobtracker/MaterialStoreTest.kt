@@ -38,6 +38,8 @@ class MaterialStoreTest {
         assertEquals("Tile adhesive", saved.inventory[1].notes)
         assertEquals("19.99", saved.inventory[1].price)
         assertEquals("Delivery", saved.inventory[2].name)
+        assertEquals("", saved.inventory[2].notes)
+        assertEquals("1 × Delivery · $25.00", materialSummary(saved.inventory[2]))
         assertEquals("25", saved.inventory[2].price)
         assertEquals("Quote pending", saved.inventory[3].name)
         assertEquals("Ask supplier", saved.inventory[3].notes)
@@ -49,6 +51,25 @@ class MaterialStoreTest {
         assertEquals(saved, JobStore(context).jobs().single())
         store.saveJobs(listOf(saved))
         assertEquals(saved, JobStore(context).jobs().single())
+    }
+
+    @Test fun legacyDescriptionsBecomeNamesWithoutDuplicatingNotesInDraftsOrHistory() = isolated { context ->
+        val prefs = context.getSharedPreferences("job_tracker", Context.MODE_PRIVATE)
+        val draft = Job(id = "legacy-draft").toJson()
+        val costs = JSONArray().put(JSONObject().put("description", "Delivery").put("amount", "25"))
+            .put(JSONObject().put("name", "Freight").put("description", "Freight").put("amount", "10"))
+            .put(JSONObject().put("name", "Supplies").put("description", "Tile adhesive").put("amount", "15"))
+        val deleted = RecycledJob(Job(id = "legacy-deleted", state = Job.COMPLETED), false).toJson().put("costs", costs)
+        prefs.edit().putString("draft", draft.toString()).putString("costs_legacy-draft", costs.toString())
+            .putString("recycle_bin", JSONArray().put(deleted).toString()).commit()
+        val store = JobStore(context)
+        listOf(store.drafts().single(), store.recycled().single().job).forEach { job ->
+            assertEquals(listOf("Delivery", "Freight", "Supplies"), job.inventory.map { it.name })
+            assertEquals(listOf("", "", "Tile adhesive"), job.inventory.map { it.notes })
+            assertEquals(listOf("25", "10", "15"), job.inventory.map { it.price })
+        }
+        assertEquals(store.drafts(), JobStore(context).drafts())
+        assertEquals(store.recycled(), JobStore(context).recycled())
     }
 
     @Test fun legacyRecycleBinExpensesSurviveMigrationAndRestore() = isolated { context ->

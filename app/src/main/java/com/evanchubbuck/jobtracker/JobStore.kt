@@ -61,7 +61,8 @@ class JobStore(context: Context) {
                 val cost = costs.getJSONObject(index).toLegacyCost()
                 materials.put(JSONObject().put("id", legacyMaterialId(id, "expense", index))
                     .put("name", cost.name.ifBlank { cost.description.ifBlank { "Material" } })
-                    .put("quantity", "").put("notes", cost.description).put("price", cost.amount))
+                    .put("quantity", "").put("notes", if (cost.name.isNotBlank() && cost.name != cost.description) cost.description else "")
+                    .put("price", cost.amount))
             }
             jobJson.put("inventory", materials)
             if (costs.length() > 0) {
