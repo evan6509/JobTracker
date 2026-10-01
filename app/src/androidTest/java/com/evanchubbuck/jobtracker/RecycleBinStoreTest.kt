@@ -24,30 +24,25 @@ class RecycleBinStoreTest {
         finally { base.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear().commit() }
     }
 
-    @Test fun persistedJobRestoresDetailsCostsAndPhotosWithoutReplacingActiveJob() = isolated { context, store ->
+    @Test fun persistedJobRestoresMaterialsPricesAndPhotosWithoutReplacingActiveJob() = isolated { context, store ->
         val job = Job(title = "Saved job", state = Job.ACTIVE, address = "123 Test Street",
             description = "Keep details", workers = listOf(Person("Worker", "608-555-0142", "Paint")),
-            inventory = listOf(InventoryItem("Paint", "2", "Blue")), photos = listOf("photo-path"), updatedAt = 1000)
-        val costs = listOf(CostItem("Materials", "19.99"))
+            inventory = listOf(InventoryItem("Paint", "2", "Blue", "19.99")), photos = listOf("photo-path"), updatedAt = 1000)
         store.saveJobs(listOf(job))
-        store.saveCostsAt(job.id, costs, 1234)
         assertTrue(store.recycle(job.id, draft = false))
         assertFalse(store.recycle(job.id, draft = false))
         assertTrue(store.jobs().isEmpty())
-        assertTrue(store.costs(job.id).isEmpty())
 
         val reopened = JobStore(context)
         val entry = reopened.recycled().single()
         assertEquals(job, entry.job)
-        assertEquals(costs, entry.costs)
         val otherActive = Job(title = "Other active", state = Job.ACTIVE, priority = 5)
         reopened.saveJobs(listOf(otherActive))
         assertEquals(RecycleRestoreResult.RESTORED, reopened.restoreRecycled(entry.id))
         val restored = reopened.jobs().first { it.id == job.id }
         assertEquals(job.copy(state = Job.PLANNED, priority = 6, updatedAt = restored.updatedAt), restored)
         assertEquals(otherActive, reopened.jobs().first { it.id == otherActive.id })
-        assertEquals(costs, reopened.costs(job.id))
-        assertEquals(1234L, reopened.costsUpdatedAt(job.id))
+        assertEquals("19.99", restored.inventory.single().price)
         assertTrue(reopened.recycled().isEmpty())
     }
 
@@ -72,17 +67,15 @@ class RecycleBinStoreTest {
     }
 
     @Test fun duplicateSyncCopyCannotOverwriteLiveJobAndEachBinCopyKeepsItsStamps() = isolated { _, store ->
-        val original = Job(title = "Original", updatedAt = 1000)
+        val original = Job(title = "Original", updatedAt = 1000, inventory = listOf(InventoryItem("Original supplies", price = "10")))
         store.saveJobs(listOf(original))
-        store.saveCostsAt(original.id, listOf(CostItem("Original costs", "10")), 1000)
         store.recycle(original.id, draft = false)
         val first = store.recycled().single()
-        val synced = original.copy(title = "Synced version", updatedAt = 9000)
+        val synced = original.copy(title = "Synced version", updatedAt = 9000, inventory = listOf(original.inventory.single().copy(name = "New supplies", price = "20")))
         store.saveJobs(listOf(synced))
-        store.saveCostsAt(original.id, listOf(CostItem("New costs", "20")), 9000)
         assertEquals(RecycleRestoreResult.ALREADY_EXISTS, store.restoreRecycled(first.id))
         assertEquals(synced, store.jobs().single())
-        assertEquals("New costs", store.costs(original.id).single().description)
+        assertEquals("20", store.jobs().single().inventory.single().price)
         assertEquals(first, store.recycled().single())
         store.recycle(synced.id, draft = false)
         val second = store.recycled().first { it.id != first.id }
@@ -90,7 +83,7 @@ class RecycleBinStoreTest {
         assertEquals(1000L, store.fieldStamps(store.jobs().single())[SyncCategory.NAME])
         store.deleteRecycled(setOf(second.id))
         assertEquals("Original", store.jobs().single().title)
-        assertEquals("Original costs", store.costs(original.id).single().description)
+        assertEquals("10", store.jobs().single().inventory.single().price)
         assertEquals(1000L, store.fieldStamps(store.jobs().single())[SyncCategory.NAME])
     }
 
@@ -123,10 +116,9 @@ class RecycleBinStoreTest {
     }
 
     @Test fun recycledJobsAndDraftsAreExcludedFromSyncEvenIfSelected() = isolated { context, store ->
-        val job = Job(title = "Deleted private job")
+        val job = Job(title = "Deleted private job", inventory = listOf(InventoryItem("Deleted supplies", price = "100")))
         val draft = Job(title = "Deleted draft")
         store.saveJobs(listOf(job))
-        store.saveCosts(job.id, listOf(CostItem("Deleted costs", "100")))
         store.saveDraft(draft)
         store.recycle(job.id, draft = false)
         store.recycle(draft.id, draft = true)

@@ -246,7 +246,7 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
             val summary = SyncArchive.merge(activity, store, incoming ?: error("No data was received."))
             withContext(Dispatchers.Main) {
                 result = summary
-                status = "Sync complete. Added ${summary.added}, updated ${summary.updated}, received ${summary.photos} photos and ${summary.costs} cost lists." +
+                status = "Sync complete. Added ${summary.added}, updated ${summary.updated}, received ${summary.photos} photos." +
                     if (summary.draftSkipped) " This phone already has three drafts; extra incoming drafts were kept on the other phone." else ""
             }
         } finally {
