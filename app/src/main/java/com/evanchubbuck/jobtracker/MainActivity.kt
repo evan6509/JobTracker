@@ -469,7 +469,8 @@ class MainActivity : ComponentActivity() {
                     })
                 "recycle_bin" -> RecycleBinScreen(recycled, area, onRestore = { restoreRecycled(it) },
                     onDeleteForever = { deleteRecycledForever(it) })
-                "history" -> HistoryScreen(jobs.filter { it.state == Job.COMPLETED }, area) { selectedId = it; screen = "detail" }
+                "history" -> HistoryScreen(jobs.filter { it.state == Job.COMPLETED }, area,
+                    onOpen = { selectedId = it; screen = "detail" }, onNavigate = { navigate(it) })
                 "sync" -> SyncScreen(sync, jobs, drafts, nearbyAllowed && networkAllowed, {
                     nearbyRequest.launch(if (Build.VERSION.SDK_INT in 31..32)
                         arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)

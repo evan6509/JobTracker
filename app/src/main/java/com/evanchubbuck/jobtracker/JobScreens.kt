@@ -363,14 +363,28 @@ private fun SyncChoiceCard(job: Job, draft: Boolean, sync: WifiDirectSync, expan
 }
 
 @Composable
-internal fun HistoryScreen(jobs: List<Job>, modifier: Modifier, onOpen: (String) -> Unit) {
+internal fun HistoryScreen(jobs: List<Job>, modifier: Modifier, onOpen: (String) -> Unit, onNavigate: (String) -> Unit) {
     Column(modifier.padding(20.dp)) {
         PageTitle("History", "Completed jobs stay here for reference.")
         if (jobs.isEmpty()) Text("No completed jobs yet.", color = muted)
         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             items(jobs.sortedByDescending { it.updatedAt }, key = { it.id }) { job ->
                 OutlinedCard(Modifier.fillMaxWidth().clickable { onOpen(job.id) }) {
-                    Column(Modifier.padding(16.dp)) { Text(job.label, color = UiInk, fontWeight = FontWeight.Bold); Text(job.address, color = muted) }
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(job.label, color = UiInk, fontWeight = FontWeight.Bold)
+                        if (job.address.isNotBlank()) Text(job.address, color = muted)
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("View details  ›", color = green, style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                            if (job.address.isNotBlank()) OutlinedButton(onClick = { onNavigate(job.address) },
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp)) {
+                                Icon(painterResource(R.drawable.ic_navigation), contentDescription = null,
+                                    modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Navigate")
+                            }
+                        }
+                    }
                 }
             }
         }
