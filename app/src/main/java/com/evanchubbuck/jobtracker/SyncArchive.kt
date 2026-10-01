@@ -22,7 +22,7 @@ internal object SyncArchive {
     fun create(context: Context, store: JobStore, selection: SyncSelection): File {
         val archive = File.createTempFile("jobtracker-send-", ".zip", context.cacheDir)
         try {
-            val manifest = JSONObject().put("format", "jobtracker-sync-v3")
+            val manifest = JSONObject().put("format", SYNC_FORMAT)
             val records = JSONArray()
             val photos = mutableListOf<Pair<String, File>>()
             store.jobs().filter { selection.jobs[it.id]?.isNotEmpty() == true }.forEachIndexed { index, job ->
@@ -116,7 +116,7 @@ internal object SyncArchive {
                     }
                 }
                 val manifest = JSONObject(manifestBytes.toString(Charsets.UTF_8.name()))
-                require(manifest.optString("format") == "jobtracker-sync-v3") {
+                require(manifest.optString("format") == SYNC_FORMAT) {
                     "Update Job Tracker on both phones to sync materials with optional prices."
                 }
                 val records = manifest.getJSONArray("jobs")

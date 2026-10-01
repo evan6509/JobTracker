@@ -213,11 +213,7 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         val input = DataInputStream(connection.getInputStream().buffered())
         val output = DataOutputStream(connection.getOutputStream().buffered())
         val nonce = ByteArray(16).also { SecureRandom().nextBytes(it) }
-        output.writeUTF("jobtracker-sync-v2")
-        output.write(nonce)
-        output.flush()
-        require(input.readUTF() == "jobtracker-sync-v2") { "Update Job Tracker on both phones to choose what gets shared." }
-        val remoteNonce = ByteArray(16).also(input::readFully)
+        val remoteNonce = exchangeSyncHello(input, output, nonce)
         val sorted = listOf(nonce, remoteNonce).sortedBy { it.toHex() }
         val digest = MessageDigest.getInstance("SHA-256").digest(sorted[0] + sorted[1])
         val number = ((digest[0].toInt() and 255) shl 16 or (digest[1].toInt() and 255) shl 8 or (digest[2].toInt() and 255)) % 1_000_000

@@ -35,6 +35,7 @@ class SelectiveSyncTest {
         val archive = SyncArchive.create(sc, source, SyncSelection(jobs = mapOf(selected.id to setOf(SyncCategory.NAME))))
         try {
             val data = manifest(archive)
+            assertEquals(SYNC_FORMAT, data.getString("format"))
             assertEquals(1, data.getJSONArray("jobs").length())
             val json = data.getJSONArray("jobs").getJSONObject(0).getJSONObject("job")
             assertFalse(json.has("inventory"))
