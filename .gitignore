@@ -29,3 +29,7 @@ SPEC.md
 google-services.json
 service-account*.json
 credentials*.json
+
+# Python release tooling
+__pycache__/
+*.pyc

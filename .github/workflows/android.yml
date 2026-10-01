@@ -8,29 +8,35 @@ on:
 permissions:
   contents: read
 
+# Hold the lock through publication so the next main run sees the new release.
+# Branch and PR checks use their own groups and cannot consume a release version.
+concurrency:
+  group: android-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'publish' || github.run_id }}
+  queue: max
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      code: ${{ steps.version.outputs.code }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Test release version selection
+        run: python3 -m unittest discover -s scripts -p 'test_release_version.py'
 
       - name: Assign version to main push
         id: version
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Run 16 published v1.2.3. Each later workflow run gets a unique higher version.
-          release_number=$((GITHUB_RUN_NUMBER - 16))
-          if (( release_number < 1 )); then
-            echo 'Expected a workflow run after v1.2.3' >&2
-            exit 1
-          fi
-          version="1.2.$((3 + release_number))"
-          code="$((8 + release_number))"
-          echo "JOBTRACKER_VERSION_NAME=$version" >> "$GITHUB_ENV"
-          echo "JOBTRACKER_VERSION_CODE=$code" >> "$GITHUB_ENV"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --slurp > releases.json
+          python3 scripts/release_version.py releases.json
 
       - name: Set up Java
         uses: actions/setup-java@v6
@@ -99,6 +105,12 @@ jobs:
             echo "create=false" >> "$GITHUB_OUTPUT"
             echo "Release $RELEASE_TAG already exists; skipping publication."
           else
+            # Never attach an APK to an orphaned tag pointing at different code.
+            if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG" && \
+                [ "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" != "$GITHUB_SHA" ]; then
+              echo "Tag $RELEASE_TAG already points at a different commit." >&2
+              exit 1
+            fi
             echo "create=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -113,6 +125,7 @@ jobs:
         if: steps.existing.outputs.create == 'true'
         env:
           RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_CODE: ${{ needs.build.outputs.code }}
         run: |
           notes_file=".github/release-notes/${RELEASE_TAG}.md"
           if [ -f "$notes_file" ]; then
@@ -129,6 +142,8 @@ jobs:
               printf '\n' >> release-notes.md
             fi
           fi
+          # Preserve Android's monotonic version code without showing it in notes.
+          printf '\n<!-- jobtracker-version-code: %s -->\n' "$RELEASE_CODE" >> release-notes.md
 
       - name: Publish release
         if: steps.existing.outputs.create == 'true'
