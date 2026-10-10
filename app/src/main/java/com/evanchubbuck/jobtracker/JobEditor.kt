@@ -34,7 +34,6 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 import java.util.Calendar
 import java.util.Locale
-import java.util.TimeZone
 
 private val editorSections = listOf("Clients", "Job site", "Schedule", "Work details", "Materials", "Outside workers", "Photos", "Review")
 private enum class PastStartPrompt { SET_DATE, SECTION, FINISH }
@@ -57,21 +56,13 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
     val visiblePage by remember(pager) { derivedStateOf { pager.currentPage } }
 
     fun startKey(value: Job) = "${value.startDate}|${value.startTime}|${value.timeZone}"
-    fun withStartDate(value: String): Job {
-        val zone = TimeZone.getDefault().id
-        val start = parseDate(value, zone)
-        val end = parseDate(job.endDate, zone)
-        val removeEnd = job.endDate.isNotBlank() && (value.isBlank() || (start != null && end != null && end < start))
-        return job.copy(startDate = value, startTime = if (value.isBlank()) "" else job.startTime,
-            endDate = if (removeEnd) "" else job.endDate, timeZone = zone)
-    }
     fun applyStartDate(value: String) {
-        val changed = withStartDate(value)
+        val changed = changeJobStartDate(job, value)
         clearedEndDate = job.endDate.isNotBlank() && changed.endDate.isBlank()
         onChange(changed)
     }
     fun setStartDate(value: String) {
-        val changed = withStartDate(value)
+        val changed = changeJobStartDate(job, value)
         if (value.isNotBlank() && startIsPast(changed)) {
             pendingPastStartDate = value
             pastStartPrompt = PastStartPrompt.SET_DATE
@@ -178,9 +169,7 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
                         DateField("Start date", job.startDate, job.timeZone, ::setStartDate)
                         DateField("End date", job.endDate, job.timeZone, { value ->
                             clearedEndDate = false
-                            if (value.isBlank() || (job.startDate.isNotBlank() &&
-                                    (parseDate(value, job.timeZone) ?: Long.MIN_VALUE) >= (parseDate(job.startDate, job.timeZone) ?: Long.MAX_VALUE)))
-                                onChange(job.copy(endDate = value, timeZone = TimeZone.getDefault().id))
+                            changeJobEndDate(job, value)?.let(onChange)
                         }, optional = true, enabled = job.startDate.isNotBlank(),
                             minDate = job.startDate.takeIf { it.isNotBlank() })
                         if (job.startDate.isBlank()) Text("Choose a start date before adding an end date.",
@@ -189,7 +178,7 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
                             color = editorMuted, style = MaterialTheme.typography.bodySmall)
                         EditorCard {
                             StartTimeField(job.startTime) {
-                                onChange(job.copy(startTime = it, timeZone = TimeZone.getDefault().id))
+                                onChange(changeJobStartTime(job, it))
                             }
                             Text("Time zone: ${job.timeZone}", color = editorMuted, style = MaterialTheme.typography.bodySmall)
                         }
@@ -260,7 +249,7 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
     }
 
     if (pastStartPrompt != null) {
-        val proposed = pendingPastStartDate?.let { withStartDate(it) } ?: job
+        val proposed = pendingPastStartDate?.let { changeJobStartDate(job, it) } ?: job
         val selectedStart = displayDate(proposed.startDate, proposed.timeZone) +
             if (proposed.startTime.isBlank()) "" else " at ${displayTime(proposed.startTime, LocalJobTimeFormat.current)}"
         AlertDialog(onDismissRequest = { pastStartPrompt = null; pendingPastStartDate = null; pendingSection = null },
@@ -271,7 +260,7 @@ internal fun EditorScreen(job: Job, step: Int, existing: Boolean, error: String,
                     when (pastStartPrompt) {
                         PastStartPrompt.SET_DATE -> {
                             val chosen = pendingPastStartDate ?: return@TextButton
-                            acknowledgedPastStart = startKey(withStartDate(chosen))
+                            acknowledgedPastStart = startKey(changeJobStartDate(job, chosen))
                             applyStartDate(chosen)
                         }
                         PastStartPrompt.SECTION -> { acknowledgedPastStart = startKey(job); onStep(pendingSection ?: step + 1) }

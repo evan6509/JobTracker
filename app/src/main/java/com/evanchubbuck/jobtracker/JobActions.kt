@@ -90,6 +90,26 @@ internal fun scheduleValidationError(job: Job): String? = when {
     else -> null
 }
 
+/** Capture the phone's zone for the first start date, then keep that zone throughout edits. */
+internal fun changeJobStartDate(job: Job, startDate: String): Job {
+    val zone = if (job.startDate.isBlank() && startDate.isNotBlank()) TimeZone.getDefault().id else job.timeZone
+    val start = parseDate(startDate, zone)
+    val end = parseDate(job.endDate, zone)
+    val removeEnd = job.endDate.isNotBlank() && (startDate.isBlank() || (start != null && end != null && end < start))
+    return job.copy(startDate = startDate, startTime = if (startDate.isBlank()) "" else job.startTime,
+        endDate = if (removeEnd) "" else job.endDate, timeZone = zone)
+}
+
+internal fun changeJobStartTime(job: Job, startTime: String): Job = job.copy(startTime = startTime)
+
+/** End-date edits must not reinterpret an existing start in the phone's current time zone. */
+internal fun changeJobEndDate(job: Job, endDate: String): Job? {
+    if (endDate.isBlank()) return job.copy(endDate = endDate)
+    val start = parseDate(job.startDate, job.timeZone) ?: return null
+    val end = parseDate(endDate, job.timeZone) ?: return null
+    return job.copy(endDate = endDate).takeIf { end >= start }
+}
+
 internal fun startIsPast(job: Job, now: Long = System.currentTimeMillis()): Boolean {
     val startDay = parseDate(job.startDate, job.timeZone) ?: return false
     if (job.startTime.isNotBlank()) return Math.floorDiv(parseStart(job) ?: return false, 60_000L) < Math.floorDiv(now, 60_000L)

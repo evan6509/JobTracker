@@ -47,6 +47,75 @@ class JobScheduleTest {
         assertEquals(60 * 60_000L, range.end - range.start)
     }
 
+    @Test fun changingOrClearingEndDateKeepsTheStartInstantAcrossPhoneTimeZones() {
+        val originalZone = TimeZone.getDefault()
+        val job = Job(startDate = "2026-10-20", startTime = "09:00", endDate = "2026-10-21", timeZone = zone)
+        val originalStart = parseStart(job)!!
+        val originalCalendarStart = calendarRange(job)!!.start
+        try {
+            listOf("America/New_York", "America/Los_Angeles", "Asia/Kolkata").forEach { phoneZone ->
+                TimeZone.setDefault(TimeZone.getTimeZone(phoneZone))
+                listOf("2026-10-23", "").forEach { endDate ->
+                    val changed = changeJobEndDate(job, endDate)!!
+                    assertEquals(endDate, changed.endDate)
+                    assertEquals(zone, changed.timeZone)
+                    assertEquals(originalStart, parseStart(changed)!!)
+                    assertEquals(originalCalendarStart, calendarRange(changed)!!.start)
+                    assertFalse(startIsPast(changed, originalStart - 30_000))
+                }
+            }
+        } finally { TimeZone.setDefault(originalZone) }
+    }
+
+    @Test fun endDateChangesStillRejectInvalidOrBackwardDates() {
+        val job = Job(startDate = "2026-10-20", endDate = "2026-10-21", timeZone = zone)
+        assertNull(changeJobEndDate(job, "2026-10-19"))
+        assertNull(changeJobEndDate(job, "2026-02-30"))
+        assertNull(changeJobEndDate(job.copy(startDate = ""), "2026-10-21"))
+        assertEquals("2026-10-20", changeJobEndDate(job, "2026-10-20")!!.endDate)
+        assertEquals("", changeJobEndDate(job.copy(startDate = ""), "")!!.endDate)
+    }
+
+    @Test fun startDateAndTimeEditsKeepTheScheduledZoneAndClearDependentDates() {
+        val originalZone = TimeZone.getDefault()
+        val job = Job(startDate = "2026-10-20", startTime = "09:00", endDate = "2026-10-21", timeZone = zone)
+        val utc = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
+        try {
+            TimeZone.setDefault(TimeZone.getTimeZone("America/New_York"))
+            val movedDate = changeJobStartDate(job, "2026-10-22")
+            assertEquals(zone, movedDate.timeZone)
+            assertEquals("2026-10-22 14:00", utc.format(Date(parseStart(movedDate)!!)))
+            assertEquals("", movedDate.endDate)
+
+            val movedTime = changeJobStartTime(job, "10:30")
+            assertEquals(zone, movedTime.timeZone)
+            assertEquals("2026-10-20 15:30", utc.format(Date(parseStart(movedTime)!!)))
+            assertEquals(job.endDate, movedTime.endDate)
+
+            val clearedTime = changeJobStartTime(job, "")
+            assertEquals(zone, clearedTime.timeZone)
+            assertEquals("2026-10-20 05:00", utc.format(Date(parseStart(clearedTime)!!)))
+
+            val clearedDate = changeJobStartDate(job, "")
+            assertEquals(zone, clearedDate.timeZone)
+            assertEquals("", clearedDate.startTime)
+            assertEquals("", clearedDate.endDate)
+            assertNull(calendarRange(clearedDate))
+        } finally { TimeZone.setDefault(originalZone) }
+    }
+
+    @Test fun firstStartDateCapturesTheCurrentPhoneZone() {
+        val originalZone = TimeZone.getDefault()
+        try {
+            TimeZone.setDefault(TimeZone.getTimeZone("America/New_York"))
+            val unscheduled = Job(startTime = "09:00", timeZone = zone)
+            val scheduled = changeJobStartDate(unscheduled, "2026-10-20")
+            assertEquals("America/New_York", scheduled.timeZone)
+            assertEquals(parseStart(Job(startDate = "2026-10-20", startTime = "09:00", timeZone = "America/New_York"))!!,
+                calendarRange(scheduled)!!.start)
+        } finally { TimeZone.setDefault(originalZone) }
+    }
+
     @Test fun currentMinuteIsNotPastUntilTheNextMinuteStarts() {
         listOf("America/Chicago", "Asia/Kolkata", "UTC").forEach { jobZone ->
             val job = Job(startDate = "2026-09-30", startTime = "23:59", timeZone = jobZone)
