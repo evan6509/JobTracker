@@ -104,7 +104,14 @@ class JobStore(context: Context) {
         check(editor.putInt("materials_schema", 1).commit()) { "Could not save materials. Please reopen Job Tracker." }
     }
 
-    fun jobs(): List<Job> = readArray("jobs").mapNotNull { runCatching { it.toJob() }.getOrNull() }
+    fun jobs(): List<Job> {
+        val byId = linkedMapOf<String, Job>()
+        readArray("jobs").mapNotNull { runCatching { it.toJob() }.getOrNull() }.forEach { job ->
+            val previous = byId[job.id]
+            if (previous == null || job.updatedAt > previous.updatedAt) byId[job.id] = job
+        }
+        return byId.values.toList()
+    }
     internal fun recycled(): List<RecycledJob> = readArray("recycle_bin").mapNotNull {
         runCatching { it.toRecycledJob() }.getOrNull()
     }
@@ -114,7 +121,7 @@ class JobStore(context: Context) {
         val current = if (draft) drafts() else jobs()
         val job = current.firstOrNull { it.id == id } ?: return false
         val entry = RecycledJob(job, draft, step = if (draft) draftStep(id) else 0,
-            fieldStamps = fieldStamps(job))
+            fieldStamps = fieldStamps(job), priceStamps = materialPriceStamps(job))
         val editor = prefs.edit().putString("recycle_bin", recycleJson(recycled() + entry))
         if (draft) {
             writeDrafts(editor, current.filterNot { it.id == id })
@@ -145,6 +152,9 @@ class JobStore(context: Context) {
             .putString("field_updated_${restored.id}", JSONObject().apply {
                 stamps.forEach { (category, time) -> put(category.name, time) }
             }.toString())
+            .putString("price_updated_${restored.id}", priceStampsJson(entry.priceStamps.ifEmpty {
+                restored.inventory.associate { it.id to (stamps[SyncCategory.COSTS] ?: entry.job.updatedAt) }
+            }))
         if (entry.draft) {
             writeDrafts(editor, liveDrafts + restored)
             editor.putInt("draft_step_${restored.id}", entry.step)
@@ -161,7 +171,9 @@ class JobStore(context: Context) {
         val remaining = bin.filterNot { it.id in entryIds }
         val liveIds = (jobs() + drafts()).map { it.id }.toSet() + remaining.map { it.job.id }
         val editor = prefs.edit().putString("recycle_bin", recycleJson(remaining))
-        removed.filter { it.job.id !in liveIds }.forEach { editor.remove("field_updated_${it.job.id}") }
+        removed.filter { it.job.id !in liveIds }.forEach {
+            editor.remove("field_updated_${it.job.id}").remove("price_updated_${it.job.id}")
+        }
         editor.apply()
         return removed
     }
@@ -196,6 +208,25 @@ class JobStore(context: Context) {
         prefs.edit().remove("draft_step_$id").apply()
     }
 
+    /** Finish once, retaining a saved copy if an older synced draft still exists. */
+    fun finishDraft(job: Job): Boolean {
+        val existingDrafts = drafts()
+        val draft = existingDrafts.firstOrNull { it.id == job.id } ?: return false
+        val existingJobs = jobs()
+        val saved = existingJobs.firstOrNull { it.id == job.id }
+        val result = saved ?: job
+        val stamps = if (saved != null) fieldStamps(saved) else changedFieldStamps(draft, job)
+        val priceStamps = if (saved != null) materialPriceStamps(saved) else changedPriceStamps(draft, job)
+        val editor = prefs.edit()
+            .putString("jobs", jobsJson(if (saved != null) existingJobs else existingJobs + result))
+            .putString("field_updated_${job.id}", fieldStampsJson(stamps))
+            .putString("price_updated_${job.id}", priceStampsJson(priceStamps))
+            .remove("draft_step_${job.id}")
+        writeDrafts(editor, existingDrafts.filterNot { it.id == job.id })
+        editor.apply()
+        return true
+    }
+
     fun saveDrafts(drafts: List<Job>) {
         require(drafts.size <= 3 && drafts.map { it.id }.distinct().size == drafts.size)
         prefs.edit().also { writeDrafts(it, drafts) }.apply()
@@ -213,6 +244,7 @@ class JobStore(context: Context) {
     }
 
     fun saveJobs(jobs: List<Job>, trackChanges: Boolean = true) {
+        require(jobs.map { it.id }.distinct().size == jobs.size) { "A job can only be saved once." }
         if (trackChanges) {
             val previous = jobs().associateBy { it.id }
             jobs.forEach { recordChangedFields(previous[it.id], it) }
@@ -230,22 +262,69 @@ class JobStore(context: Context) {
     }
 
     internal fun saveFieldStamps(id: String, stamps: Map<SyncCategory, Long>) {
-        val json = JSONObject().apply { stamps.forEach { (category, time) ->
-            put(category.name, time)
-        } }
-        prefs.edit().putString("field_updated_$id", json.toString()).apply()
+        prefs.edit().putString("field_updated_$id", fieldStampsJson(stamps)).apply()
+    }
+
+    internal fun materialPriceStamps(job: Job): Map<String, Long> {
+        val saved = runCatching { prefs.getString("price_updated_${job.id}", null)?.let(::JSONObject) }.getOrNull()
+        val legacyStamp = fieldStamps(job).getValue(SyncCategory.COSTS)
+        return job.inventory.associate { item ->
+            item.id to if (saved == null) legacyStamp else saved.optLong(item.id, 0L)
+        }
+    }
+
+    internal fun saveSyncState(jobs: List<Job>, drafts: List<Job>,
+                               stamps: Map<String, Map<SyncCategory, Long>>,
+                               priceStamps: Map<String, Map<String, Long>>, draftSteps: Map<String, Int>) {
+        require(jobs.map { it.id }.distinct().size == jobs.size)
+        require(drafts.size <= 3 && drafts.map { it.id }.distinct().size == drafts.size)
+        require(drafts.none { draft -> jobs.any { it.id == draft.id } })
+        val editor = prefs.edit().putString("jobs", jobsJson(jobs))
+        writeDrafts(editor, drafts)
+        this.drafts().filterNot { old -> drafts.any { it.id == old.id } }.forEach {
+            editor.remove("draft_step_${it.id}")
+        }
+        stamps.forEach { (id, values) -> editor.putString("field_updated_$id", fieldStampsJson(values)) }
+        priceStamps.forEach { (id, values) -> editor.putString("price_updated_$id", priceStampsJson(values)) }
+        draftSteps.forEach { (id, step) -> editor.putInt("draft_step_$id", step.coerceIn(0, 7)) }
+        check(editor.commit()) { "Could not save synced jobs. Please try again." }
+    }
+
+    private fun fieldStampsJson(stamps: Map<SyncCategory, Long>) = JSONObject().apply {
+        stamps.forEach { (category, time) -> put(category.name, time) }
+    }.toString()
+
+    private fun priceStampsJson(stamps: Map<String, Long>) = JSONObject().apply {
+        stamps.forEach { (id, time) -> put(id, time) }
+    }.toString()
+
+    private fun changedFieldStamps(old: Job?, updated: Job): Map<SyncCategory, Long> {
+        val stamps = old?.let(::fieldStamps).orEmpty().toMutableMap()
+        SyncCategory.entries.forEach { category ->
+            if (old == null || old.syncValue(category) != updated.syncValue(category)) stamps[category] = updated.updatedAt
+        }
+        return stamps
+    }
+
+    private fun changedPriceStamps(old: Job?, updated: Job): Map<String, Long> {
+        val stamps = old?.let(::materialPriceStamps).orEmpty()
+        val previous = old?.inventory.orEmpty().associateBy { it.id }
+        return updated.inventory.associate { item ->
+            val prior = previous[item.id]
+            item.id to when {
+                prior == null -> updated.updatedAt
+                prior.price != item.price -> updated.updatedAt
+                else -> stamps[item.id] ?: 0L
+            }
+        }
     }
 
     private fun recordChangedFields(old: Job?, updated: Job) {
-        val stamps = old?.let(::fieldStamps).orEmpty().toMutableMap()
-        var changed = old == null
-        SyncCategory.entries.forEach { category ->
-            if (old == null || old.syncValue(category) != updated.syncValue(category)) {
-                stamps[category] = updated.updatedAt
-                changed = true
-            }
-        }
-        if (changed) saveFieldStamps(updated.id, stamps)
+        val stamps = changedFieldStamps(old, updated)
+        val prices = changedPriceStamps(old, updated)
+        val editor = prefs.edit().putString("price_updated_${updated.id}", priceStampsJson(prices))
+        if (old == null || stamps != fieldStamps(old)) editor.putString("field_updated_${updated.id}", fieldStampsJson(stamps))
+        editor.apply()
     }
 
     private fun readArray(key: String): List<JSONObject> = runCatching {

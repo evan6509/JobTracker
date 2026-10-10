@@ -515,13 +515,18 @@ class MainActivity : ComponentActivity() {
                                     workers = current.workers.filter { it.name.isNotBlank() || it.phone.isNotBlank() || it.work.isNotBlank() },
                                     inventory = current.inventory.filter { it.name.isNotBlank() },
                                     priority = (jobs.maxOfOrNull { it.priority } ?: -1) + 1, updatedAt = System.currentTimeMillis())
-                                val hadActive = jobs.any { it.state == Job.ACTIVE }
-                                persist(jobs + saved)
-                                store.deleteDraft(activeDraftId)
-                                drafts = drafts.filterNot { it.id == activeDraftId }
+                                val previousJobs = store.jobs()
+                                val finished = store.finishDraft(saved)
+                                jobs = store.jobs()
+                                drafts = store.drafts()
                                 activeDraftId = ""; editor = null
-                                selectedId = saved.id; screen = "detail"
-                                if (!hadActive) activateId = saved.id
+                                if (finished) {
+                                    selectedId = saved.id; screen = "detail"
+                                    if (previousJobs.none { it.state == Job.ACTIVE || it.id == saved.id }) activateId = saved.id
+                                } else {
+                                    screen = "drafts"
+                                    message = "This draft is no longer available."
+                                }
                             } else { editor = null; selectedId = editingId; screen = "detail" }
                         })
                 }
