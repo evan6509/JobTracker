@@ -11,7 +11,8 @@ internal data class RecycledJob(
     val id: String = UUID.randomUUID().toString(),
     val deletedAt: Long = System.currentTimeMillis(),
     val step: Int = 0,
-    val fieldStamps: Map<SyncCategory, Long> = emptyMap()
+    val fieldStamps: Map<SyncCategory, Long> = emptyMap(),
+    val priceStamps: Map<String, Long> = emptyMap()
 )
 
 internal enum class RecycleRestoreResult { RESTORED, DRAFT_LIMIT, ALREADY_EXISTS, MISSING }
@@ -26,11 +27,15 @@ internal fun deleteUnreferencedJobPhotos(context: Context, paths: List<String>, 
 internal fun RecycledJob.toJson() = JSONObject().put("id", id).put("job", job.toJson())
     .put("draft", draft).put("deletedAt", deletedAt).put("step", step)
     .put("fieldUpdated", JSONObject().apply { fieldStamps.forEach { (category, time) -> put(category.name, time) } })
+    .put("priceUpdated", JSONObject().apply { priceStamps.forEach { (id, time) -> put(id, time) } })
 
 internal fun JSONObject.toRecycledJob(): RecycledJob {
     return RecycledJob(getJSONObject("job").toJob(), getBoolean("draft"), getString("id"),
         getLong("deletedAt"), optInt("step").coerceIn(0, 7),
         optJSONObject("fieldUpdated")?.let { stamps ->
             SyncCategory.entries.filter { stamps.has(it.name) }.associateWith { stamps.getLong(it.name) }
+        }.orEmpty(),
+        optJSONObject("priceUpdated")?.let { stamps ->
+            stamps.keys().asSequence().associateWith { stamps.getLong(it) }
         }.orEmpty())
 }

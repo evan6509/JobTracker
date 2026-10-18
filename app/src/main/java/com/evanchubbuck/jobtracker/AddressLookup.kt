@@ -64,7 +64,7 @@ internal fun addressSearchEntry(query: String): AddressSearchEntry {
     val entered = query.trim()
     val number = typedHouseNumber(entered) ?: return AddressSearchEntry(entered)
     val unitPattern = Regex(
-        "(?:\\s+|,\\s*)(apt\\.?|apartment|unit|suite|ste\\.?|floor|fl\\.?|room|rm\\.?|#)\\s*#?\\s*([A-Za-z0-9][A-Za-z0-9-]{0,15})",
+        "(?:\\s+|,\\s*)(?:(?:apt\\.?|apartment|unit|suite|ste\\.?|floor|fl\\.?|room|rm\\.?)(?=\\s|#)\\s*#?\\s*|#\\s*)([A-Za-z0-9][A-Za-z0-9-]{0,15})",
         RegexOption.IGNORE_CASE)
     val match = unitPattern.find(entered) ?: return AddressSearchEntry(entered)
     val before = entered.substring(0, match.range.first)
@@ -92,6 +92,9 @@ internal fun expandFinalStreetType(query: String): String {
     return query.trim().dropLast(suffix.value.length) + " " + expanded
 }
 
+private val addressDirections = mapOf("n" to "north", "s" to "south", "e" to "east", "w" to "west",
+    "ne" to "northeast", "nw" to "northwest", "se" to "southeast", "sw" to "southwest")
+
 private fun addressWords(value: String): List<String> = value.lowercase(Locale.ROOT)
     .replace(Regex("\\bu\\.?\\s*s\\.?\\s*(?:highway|hwy|route|rte)?\\s*-?\\s*(\\d+)\\b"), "us highway $1")
     .split(Regex("[^\\p{L}\\p{N}]+"))
@@ -100,18 +103,62 @@ private fun addressWords(value: String): List<String> = value.lowercase(Locale.R
             "ave", "av" -> "avenue"; "st" -> "street"; "rd" -> "road"; "dr" -> "drive"
             "blvd" -> "boulevard"; "ln" -> "lane"; "ct" -> "court"; "pl" -> "place"
             "hwy" -> "highway"; "pkwy" -> "parkway"; "cir" -> "circle"; "trl" -> "trail"
-            "n" -> "north"; "s" -> "south"; "e" -> "east"; "w" -> "west"
-            "ne" -> "northeast"; "nw" -> "northwest"; "se" -> "southeast"; "sw" -> "southwest"
-            else -> it
+            else -> addressDirections[it] ?: it
         }
     }
 
-private fun areaMatches(requested: String, area: String): Boolean {
-    val wanted = addressWords(requested)
+private val usAddressStateNames = mapOf(
+    "AL" to "Alabama", "AK" to "Alaska", "AZ" to "Arizona", "AR" to "Arkansas",
+    "CA" to "California", "CO" to "Colorado", "CT" to "Connecticut", "DE" to "Delaware",
+    "DC" to "District of Columbia", "FL" to "Florida", "GA" to "Georgia", "HI" to "Hawaii",
+    "ID" to "Idaho", "IL" to "Illinois", "IN" to "Indiana", "IA" to "Iowa", "KS" to "Kansas",
+    "KY" to "Kentucky", "LA" to "Louisiana", "ME" to "Maine", "MD" to "Maryland",
+    "MA" to "Massachusetts", "MI" to "Michigan", "MN" to "Minnesota", "MS" to "Mississippi",
+    "MO" to "Missouri", "MT" to "Montana", "NE" to "Nebraska", "NV" to "Nevada",
+    "NH" to "New Hampshire", "NJ" to "New Jersey", "NM" to "New Mexico", "NY" to "New York",
+    "NC" to "North Carolina", "ND" to "North Dakota", "OH" to "Ohio", "OK" to "Oklahoma",
+    "OR" to "Oregon", "PA" to "Pennsylvania", "RI" to "Rhode Island", "SC" to "South Carolina",
+    "SD" to "South Dakota", "TN" to "Tennessee", "TX" to "Texas", "UT" to "Utah",
+    "VT" to "Vermont", "VA" to "Virginia", "WA" to "Washington", "WV" to "West Virginia",
+    "WI" to "Wisconsin", "WY" to "Wyoming", "PR" to "Puerto Rico", "GU" to "Guam",
+    "VI" to "Virgin Islands", "AS" to "American Samoa", "MP" to "Northern Mariana Islands",
+)
+
+/** Expand a U.S. region suffix before prefix matching, keeping partial city names searchable. */
+private fun areaWords(value: String, countryCode: String, result: Boolean): List<String> {
+    val country = normalizedAddressCountry(countryCode)
+    if (country != null && country != "US") return addressWords(value)
+    val enteredWords = value.split(Regex("[^\\p{L}\\p{N}]+"))
+        .filter { it.isNotBlank() }
+    val words = enteredWords.map { it.lowercase(Locale.ROOT) }
+    var regionEnd = words.size
+    val countrySuffix = listOf(listOf("united", "states", "of", "america"),
+        listOf("united", "states"), listOf("usa"), listOf("us"))
+        .firstOrNull { words.takeLast(it.size) == it }
+    if (countrySuffix != null) regionEnd -= countrySuffix.size
+    if (regionEnd >= 2 && words[regionEnd - 1].matches(Regex("\\d{4}")) &&
+        words[regionEnd - 2].matches(Regex("\\d{5}"))) regionEnd -= 2
+    else if (regionEnd > 0 && words[regionEnd - 1].matches(Regex("\\d{5}"))) regionEnd--
+    val stateIndex = regionEnd - 1
+    // A lone "Ma" can begin Madison; an explicit uppercase "MA" denotes a state.
+    if (stateIndex < 0 || (!result && stateIndex == 0 &&
+            enteredWords[0] != enteredWords[0].uppercase(Locale.ROOT))) return addressWords(value)
+    val state = usAddressStateNames[words[stateIndex].uppercase(Locale.ROOT)] ?: return addressWords(value)
+    val expanded = words.take(stateIndex) + state + words.drop(stateIndex + 1)
+    return addressWords(expanded.joinToString(" "))
+}
+
+private fun areaMatches(requested: String, area: String, countryCode: String = ""): Boolean {
+    val wanted = areaWords(requested, countryCode, result = false)
     if (wanted.isEmpty()) return true
-    return addressWords(area).windowed(wanted.size).any { found ->
+    val cityPrefix = addressWords(requested)
+    val city = addressWords(area.substringBefore(','))
+    // "San Ma" can still be a partial city name, rather than San, Massachusetts.
+    if (',' in area && (cityPrefix.size > 1 || cityPrefix == wanted) && cityPrefix.size <= city.size &&
+        city.take(cityPrefix.size).zip(cityPrefix).all { (actual, typed) -> actual.startsWith(typed) }) return true
+    return areaWords(area, countryCode, result = true).windowed(wanted.size).any { found ->
         found.zip(wanted).all { (actual, typed) ->
-            actual.startsWith(typed) || (actual.length == 2 && typed.length >= 4 && typed.startsWith(actual))
+            actual.startsWith(typed)
         }
     }
 }
@@ -129,12 +176,22 @@ private fun addressDistanceKm(point: AddressPoint, origin: AddressPoint): Double
 private fun hasStreetType(query: String, number: String): Boolean =
     addressWords(query.trim().removePrefix(number).trimStart().substringBefore(',')).any { it in roadTypes }
 
+/** Keep the original region suffix: CT and NE have different meanings in streets and areas. */
+private fun addressAreaTail(query: String, streetWordCount: Int): String {
+    val streetPrefix = addressWords(query).take(streetWordCount)
+    val streetEnd = Regex("[\\p{L}\\p{N}]+").findAll(query).firstOrNull { token ->
+        addressWords(query.substring(0, token.range.last + 1)) == streetPrefix
+    }?.range?.last ?: return ""
+    return query.substring(streetEnd + 1).trim()
+}
+
 /** Keep only matching numbered results; street fallbacks retain, but do not verify, the typed number. */
 internal fun numberedAddressSuggestions(query: String, rows: List<AddressSuggestion>): List<AddressSuggestion> {
     val number = typedHouseNumber(query) ?: return rows
     fun normalizeNumber(value: String) = value.filterNot(Char::isWhitespace).lowercase()
-    val queryStreet = addressWords(query.trim().removePrefix(number).trimStart().substringBefore(','))
-    val directions = setOf("north", "south", "east", "west", "northeast", "northwest", "southeast", "southwest")
+    val streetEntry = query.trim().removePrefix(number).trimStart().substringBefore(',')
+    val queryStreet = addressWords(streetEntry)
+    val directions = addressDirections.values.toSet()
     return rows.mapNotNull { row ->
         val streetName = row.street.removePrefix(row.houseNumber).trimStart()
         val streetWords = addressWords(streetName).let { found ->
@@ -142,11 +199,18 @@ internal fun numberedAddressSuggestions(query: String, rows: List<AddressSuggest
         }
         val shared = minOf(streetWords.size, queryStreet.size)
         if (queryStreet.isNotEmpty() && (streetWords.isEmpty() ||
-            !streetWords.take(shared).zip(queryStreet.take(shared)).all { (found, requested) -> found.startsWith(requested) } ||
-            (queryStreet.size > streetWords.size &&
-                (queryStreet[streetWords.size] in roadTypes || !areaMatches(
-                    queryStreet.drop(streetWords.size).joinToString(" "), row.area))))) {
+            !streetWords.take(shared).zip(queryStreet.take(shared)).all { (found, requested) -> found.startsWith(requested) })) {
             return@mapNotNull null
+        }
+        if (queryStreet.size > streetWords.size) {
+            val areaTail = addressAreaTail(streetEntry, streetWords.size)
+            val tailWords = addressWords(areaTail)
+            val regionWords = areaWords(areaTail, row.countryCode, result = false)
+            val incompleteStreetType = streetWords.none { it in roadTypes } && tailWords.firstOrNull() in roadTypes
+            // A bare NE still belongs to the street; a city or comma makes the region explicit.
+            val unmatchedDirection = tailWords.size == 1 && tailWords.single() in directions && regionWords != tailWords
+            if (incompleteStreetType || unmatchedDirection || regionWords.firstOrNull() in roadTypes ||
+                !areaMatches(areaTail, row.area, row.countryCode)) return@mapNotNull null
         }
         when {
             row.houseNumber.isBlank() -> row.copy(street = "$number $streetName", numberFromEntry = true)
@@ -166,7 +230,7 @@ internal fun nearbyAddressSuggestions(rows: List<AddressSuggestion>, near: Addre
         else -> 20.0
     }
     return rows.withIndex().sortedWith(compareBy<IndexedValue<AddressSuggestion>> {
-            requestedArea.isNotEmpty() && !areaMatches(requestedArea, it.value.area)
+            requestedArea.isNotEmpty() && !areaMatches(requestedArea, it.value.area, it.value.countryCode)
         }
         .thenBy { confidencePenalty(it.value) + (near?.let { point -> addressDistanceKm(it.value.point, point) } ?: 0.0) }
         .thenBy { it.index }).map { it.value }.take(10)
@@ -221,7 +285,7 @@ internal class JobAddressLookup(private val phone: AddressLookup, private val ph
         }
         val requestedArea = query.substringAfter(',', "").trim()
         fun hasRelevantNumber(rows: List<AddressSuggestion>) = rows.any {
-            !it.numberFromEntry && it.houseNumber.isNotBlank() && areaMatches(requestedArea, it.area) &&
+            !it.numberFromEntry && it.houseNumber.isNotBlank() && areaMatches(requestedArea, it.area, it.countryCode) &&
                 (requestedArea.isNotBlank() || near == null || addressDistanceKm(it.point, near) <= 10.0)
         }
         val first = select<Pair<Boolean, LookupOutcome>> {
@@ -260,7 +324,7 @@ internal class JobAddressLookup(private val phone: AddressLookup, private val ph
                 }
                 val nativeMatches = numberedAddressSuggestions(query, streetOnly(nativeStreet.await().rows))
                 val usefulNative = nativeMatches.any {
-                    if (requestedArea.isNotBlank()) areaMatches(requestedArea, it.area)
+                    if (requestedArea.isNotBlank()) areaMatches(requestedArea, it.area, it.countryCode)
                     else near == null || addressDistanceKm(it.point, near) <= 10.0
                 }
                 val remoteMatches = if (usefulNative) {
