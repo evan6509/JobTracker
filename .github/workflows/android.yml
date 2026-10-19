@@ -82,7 +82,7 @@ jobs:
           name: JobTracker-debug-apk
           path: app/build/outputs/apk/published/debug/app-published-debug.apk
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
 
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
