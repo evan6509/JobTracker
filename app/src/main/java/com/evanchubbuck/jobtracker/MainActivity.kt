@@ -157,14 +157,27 @@ class MainActivity : ComponentActivity() {
             if (screen == "sync" && nearbyAllowed && networkAllowed) sync.start()
             onDispose { if (screen == "sync") sync.stop() }
         }
-        LaunchedEffect(sync.result) {
-            if (sync.result != null) {
-                jobs = store.jobs()
-                drafts = store.drafts()
+        // Storage changes remain observable even when the sync screen's scope is canceled.
+        DisposableEffect(store) {
+            val prefs = getSharedPreferences("job_tracker", MODE_PRIVATE)
+            val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key in setOf("jobs", "drafts", "recycle_bin")) scope.launch {
+                    jobs = store.jobs()
+                    drafts = store.drafts()
+                    recycled = store.recycled()
+                }
             }
+            prefs.registerOnSharedPreferenceChangeListener(listener)
+            jobs = store.jobs()
+            drafts = store.drafts()
+            recycled = store.recycled()
+            onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
         }
 
-        fun persist(list: List<Job>) { jobs = list; store.saveJobs(list) }
+        fun persist(list: List<Job>) {
+            store.applyJobChanges(jobs, list)
+            jobs = store.jobs()
+        }
         fun deleteUnusedPhotos(paths: List<String>, usedPhotos: Set<String>) {
             val retainedPhotos = usedPhotos + store.recycled().flatMap { it.job.photos }
             deleteUnreferencedJobPhotos(this@MainActivity, paths, retainedPhotos)
@@ -200,14 +213,16 @@ class MainActivity : ComponentActivity() {
             deleteUnusedPhotos(removed.flatMap { it.job.photos }, usedPhotos)
         }
         fun changeEditor(value: Job) {
-            editor = value
+            val before = editor ?: return
+            val changed = value.copy(updatedAt = System.currentTimeMillis())
             if (editingId.isBlank()) {
-                val changed = value.copy(updatedAt = System.currentTimeMillis())
-                drafts = drafts.map { if (it.id == activeDraftId) changed else it }
-                editor = changed
-                store.saveDraft(changed)
+                editor = store.applyDraftChange(before, changed)
+                drafts = store.drafts()
+            } else {
+                store.applyJobChanges(listOf(before), listOf(changed))
+                jobs = store.jobs()
+                editor = jobs.firstOrNull { it.id == editingId }
             }
-            else persist(jobs.map { if (it.id == editingId) value.copy(updatedAt = System.currentTimeMillis()) else it })
         }
         fun openEditor(id: String = "", section: Int = 0) {
             editingId = id
@@ -310,12 +325,15 @@ class MainActivity : ComponentActivity() {
             if (current != null && uris.isNotEmpty()) {
                 val editSession = editingId
                 scope.launch {
-                    val paths = withContext(Dispatchers.IO) { uris.mapNotNull { copyPhoto(this@MainActivity, it) } }
-                    val latest = editor ?: if (editingId.isBlank()) drafts.firstOrNull { it.id == activeDraftId }
-                        else jobs.firstOrNull { it.id == editingId }
-                    if (latest?.id == current.id && editingId == editSession && screen == "editor") changeEditor(latest.copy(photos = latest.photos + paths))
-                    else paths.forEach { File(it).delete() }
-                    if (paths.size != uris.size) message = "Some photos could not be added."
+                    val count = importJobPhotos(uris, { copyPhoto(this@MainActivity, it) }) { paths ->
+                        val latest = editor ?: if (editingId.isBlank()) drafts.firstOrNull { it.id == activeDraftId }
+                            else jobs.firstOrNull { it.id == editingId }
+                        if (latest?.id == current.id && editingId == editSession && screen == "editor") {
+                            changeEditor(latest.copy(photos = latest.photos + paths))
+                            true
+                        } else false
+                    }
+                    if (count != uris.size) message = "Some photos could not be added."
                 }
             }
         }

@@ -205,7 +205,7 @@ internal fun sharePayload(job: Job, includePrices: Boolean = false): String = JS
 
 internal fun qrBitmap(value: String): Bitmap? = runCatching {
     val matrix = QRCodeWriter().encode(value, BarcodeFormat.QR_CODE, 700, 700,
-        mapOf(EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M, EncodeHintType.MARGIN to 2))
+        mapOf(EncodeHintType.CHARACTER_SET to "UTF-8", EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M, EncodeHintType.MARGIN to 2))
     val pixels = IntArray(matrix.width * matrix.height) { index ->
         if (matrix[index % matrix.width, index / matrix.width]) android.graphics.Color.BLACK else android.graphics.Color.WHITE
     }
