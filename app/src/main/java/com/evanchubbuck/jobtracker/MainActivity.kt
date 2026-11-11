@@ -21,9 +21,12 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
@@ -40,6 +43,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.repeatOnLifecycle
 import com.evanchubbuck.jobtracker.ui.theme.JobTrackerTheme
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -50,6 +54,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private val ReleaseDownloadSaver = listSaver<ReleaseDownload?, Any>(
+    save = { download -> download?.let { listOf(it.id, it.tag, it.highlights) }.orEmpty() },
+    restore = { ReleaseDownload(it[0] as Long, it[1] as String, it[2] as String) }
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -126,15 +135,25 @@ class MainActivity : ComponentActivity() {
         var scanRaw by rememberSaveable { mutableStateOf("") }
         var checkingUpdate by remember { mutableStateOf(false) }
         var latestRelease by remember { mutableStateOf<GitHubRelease?>(null) }
+        var releaseDownload by rememberSaveable(stateSaver = ReleaseDownloadSaver) {
+            mutableStateOf<ReleaseDownload?>(null)
+        }
+        var lastDownloadedTag by rememberSaveable { mutableStateOf<String?>(null) }
+        val download = releaseDownload
+        var downloadReady by remember(download?.id) { mutableStateOf(false) }
+        val updateSnackbar = remember { SnackbarHostState() }
         val scanPreview = remember(scanRaw) { runCatching { if (scanRaw.isBlank()) null else JSONObject(scanRaw).getJSONObject("job").toJob() }.getOrNull() }
         val scanSource = remember(scanRaw) { runCatching { JSONObject(scanRaw).getString("source") }.getOrDefault("") }
         val scope = rememberCoroutineScope()
         DisposableEffect(releaseUpdatesEnabled) {
             var startupCheck: kotlinx.coroutines.Job? = null
             fun checkOnOpen() {
-                if (releaseUpdatesEnabled && startupCheck?.isActive != true) {
+                if (releaseUpdatesEnabled && releaseDownload == null && startupCheck?.isActive != true) {
                     startupCheck = scope.launch {
-                        startupUpdate(installedVersion)?.let { latestRelease = it }
+                        val release = startupUpdate(installedVersion)
+                        if (release != null && !checkingUpdate && releaseDownload == null && release.tag != lastDownloadedTag) {
+                            latestRelease = release
+                        }
                     }
                 }
             }
@@ -150,6 +169,26 @@ class MainActivity : ComponentActivity() {
             onDispose {
                 lifecycle.removeObserver(observer)
                 startupCheck?.cancel()
+            }
+        }
+
+        LaunchedEffect(download?.id) {
+            if (download == null) return@LaunchedEffect
+            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                downloadReady = try {
+                    awaitReleaseDownload(this@MainActivity, download.id)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    false
+                }
+                updateSnackbar.currentSnackbarData?.dismiss()
+                if (downloadReady) {
+                    lastDownloadedTag = download.tag
+                } else {
+                    releaseDownload = null
+                    message = "Couldn't finish downloading ${download.tag}. Check for updates to try again."
+                }
             }
         }
 
@@ -368,6 +407,10 @@ class MainActivity : ComponentActivity() {
         fun scan() { scanner.launch(ScanOptions().setCaptureActivity(JobScannerActivity::class.java).setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Scan a JobTracker job QR code").setBeepEnabled(false).setOrientationLocked(false)) }
         fun checkForUpdate() {
             if (!releaseUpdatesEnabled || checkingUpdate) return
+            if (releaseDownload != null) {
+                if (!downloadReady) scope.launch { updateSnackbar.showSnackbar("The update is downloading.") }
+                return
+            }
             checkingUpdate = true
             scope.launch {
                 try {
@@ -383,7 +426,7 @@ class MainActivity : ComponentActivity() {
         }
 
         BackHandler(screen != "home") { back() }
-        Scaffold(containerColor = UiCanvas, topBar = {
+        Scaffold(containerColor = UiCanvas, snackbarHost = { SnackbarHost(updateSnackbar) }, topBar = {
             Surface(color = UiInk) {
                 Row(Modifier.fillMaxWidth().statusBarsPadding().height(52.dp).padding(horizontal = 12.dp),
                     verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
@@ -609,13 +652,14 @@ class MainActivity : ComponentActivity() {
             AlertDialog(onDismissRequest = { latestRelease = null },
                 title = { Text(if (newer) "Update available" else "JobTracker is up to date") },
                 text = { Text("Installed: v$installedVersion\nLatest release: ${release.tag}" +
-                    if (newer) "\n\nDownload the APK, then tap the completed download notification to install it. Android may ask you to allow installs from JobTracker." else "") },
+                    if (newer) "\n\nJobTracker will show what's new when the update is ready to install." else "") },
                 confirmButton = {
                     TextButton(onClick = {
                         if (newer) {
                             try {
-                                downloadRelease(this@MainActivity, release)
-                                message = "Downloading ${release.tag}. Tap its notification when the download finishes to install it. Allow installs from JobTracker if Android asks."
+                                val id = downloadRelease(this@MainActivity, release)
+                                releaseDownload = ReleaseDownload(id, release.tag, release.highlights)
+                                scope.launch { updateSnackbar.showSnackbar("Downloading ${release.tag}…") }
                             } catch (_: Exception) {
                                 message = "Couldn't start the update download. Please try again."
                             }
@@ -624,6 +668,30 @@ class MainActivity : ComponentActivity() {
                     }) { Text(if (newer) "Download APK" else "OK") }
                 },
                 dismissButton = if (newer) ({ TextButton(onClick = { latestRelease = null }) { Text("Cancel") } }) else null)
+        }
+        if (download != null && downloadReady) {
+            val dismiss = { releaseDownload = null }
+            AlertDialog(
+                onDismissRequest = dismiss,
+                title = { Text("What's new in ${download.tag}") },
+                text = {
+                    Text(
+                        download.highlights.ifBlank { "The update is ready to install." },
+                        modifier = Modifier.verticalScroll(rememberScrollState())
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        dismiss()
+                        try {
+                            installRelease(this@MainActivity, download.id)
+                        } catch (_: Exception) {
+                            message = "Couldn't open the installer. Try the completed download notification or check for updates again."
+                        }
+                    }) { Text("Install now") }
+                },
+                dismissButton = { TextButton(onClick = dismiss) { Text("Later") } }
+            )
         }
         if (message.isNotBlank()) AlertDialog(onDismissRequest = { message = "" }, title = { Text("JobTracker") },
             text = { Text(message) }, confirmButton = { TextButton(onClick = { message = "" }) { Text("OK") } })

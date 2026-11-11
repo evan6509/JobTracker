@@ -38,6 +38,30 @@ class ReleaseUpdatesTest {
         assertFalse(isNewerRelease("unexpected", "1.1.1"))
     }
 
+    @Test fun showsTheFirstThreeReleaseHighlightsWithoutMarkdownOrMetadata() {
+        val notes = """
+            # What's new
+
+            - **Add photos** to jobs.
+            - Open [Settings](https://example.com/settings) to manage sharing.
+            - Keep `drafts` when syncing.
+            - This fourth item is omitted.
+
+            [Full changelog](https://example.com/compare)
+            <!-- jobtracker-version-code: 11 -->
+        """.trimIndent()
+
+        assertEquals(
+            "• Add photos to jobs.\n\n• Open Settings to manage sharing.\n\n• Keep drafts when syncing.",
+            releaseHighlights(notes)
+        )
+    }
+
+    @Test fun acceptsPlainNotesAndIgnoresMetadataOnlyBodies() {
+        assertEquals("Improves photo loading.", releaseHighlights("Improves photo loading."))
+        assertEquals("", releaseHighlights("# What's new\n<!-- release metadata -->"))
+    }
+
     @Test fun explainsConnectionFailuresWithoutTechnicalDetails() {
         assertEquals(
             "Couldn't reach GitHub to check for updates. Check your internet connection and try again. If you're online, GitHub may be temporarily unavailable.",
