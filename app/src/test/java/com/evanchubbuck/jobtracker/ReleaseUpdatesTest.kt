@@ -36,6 +36,7 @@ class ReleaseUpdatesTest {
         assertFalse(isNewerRelease("v1.1.1", "1.1.1"))
         assertFalse(isNewerRelease("v1.1.1", "1.1.2"))
         assertFalse(isNewerRelease("unexpected", "1.1.1"))
+        assertFalse(isNewerRelease("v9999999999.0.0", "1.1.1"))
     }
 
     @Test fun showsTheFirstThreeReleaseHighlightsWithoutMarkdownOrMetadata() {

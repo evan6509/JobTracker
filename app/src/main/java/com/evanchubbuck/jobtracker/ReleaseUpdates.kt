@@ -5,9 +5,11 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Environment
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import org.json.JSONObject
 import java.io.IOException
 import java.net.ConnectException
@@ -19,10 +21,44 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 internal data class GitHubRelease(val tag: String, val apkUrl: String, val highlights: String = "")
 
-internal data class ReleaseDownload(val id: Long, val tag: String, val highlights: String)
+internal data class ReleaseDownload(
+    val id: Long,
+    val tag: String,
+    val highlights: String,
+    val deferred: Boolean = false
+)
+
+internal class ReleaseDownloadStore(context: Context) {
+    private val prefs: SharedPreferences =
+        context.getSharedPreferences("release_download", Context.MODE_PRIVATE)
+
+    fun load(): ReleaseDownload? {
+        val id = prefs.getLong("id", -1)
+        val tag = prefs.getString("tag", null) ?: return null
+        if (id < 0 || !versionPattern.matches(tag)) return null
+        return ReleaseDownload(
+            id, tag, prefs.getString("highlights", "").orEmpty(),
+            prefs.getBoolean("deferred", false)
+        )
+    }
+
+    fun save(download: ReleaseDownload?) {
+        prefs.edit {
+            if (download == null) {
+                clear()
+            } else {
+                putLong("id", download.id)
+                putString("tag", download.tag)
+                putString("highlights", download.highlights)
+                putBoolean("deferred", download.deferred)
+            }
+        }
+    }
+}
 
 private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
 
@@ -64,9 +100,11 @@ internal fun releaseHighlights(body: String): String {
 }
 
 internal fun isNewerRelease(tag: String, installedVersion: String): Boolean {
-    val latest = versionPattern.matchEntire(tag)?.groupValues?.drop(1)?.map(String::toInt) ?: return false
-    val installed = versionPattern.matchEntire(installedVersion)?.groupValues?.drop(1)?.map(String::toInt) ?: return false
-    return latest.zip(installed).firstOrNull { (a, b) -> a != b }?.let { (a, b) -> a > b } ?: false
+    val latest = versionPattern.matchEntire(tag)?.destructured?.toList() ?: return false
+    val installed = versionPattern.matchEntire(installedVersion)?.destructured?.toList() ?: return false
+    val latestParts = latest.map { it.toIntOrNull() ?: return false }
+    val installedParts = installed.map { it.toIntOrNull() ?: return false }
+    return latestParts.zip(installedParts).firstOrNull { (a, b) -> a != b }?.let { (a, b) -> a > b } ?: false
 }
 
 /** One quiet attempt per app opening; failed checks are left for the next opening. */
@@ -105,7 +143,7 @@ internal suspend fun fetchLatestRelease(): GitHubRelease = withContext(Dispatche
             .map { assets.getJSONObject(it) }
             .firstOrNull { it.optString("name") == expectedName && it.optString("browser_download_url") == expectedUrl }
             ?: throw UpdateCheckReleaseException("An update was found, but its download isn't available yet. Please try again later.")
-        val notes = if (release.isNull("body")) "" else release.getString("body")
+        val notes = release.opt("body") as? String ?: ""
         GitHubRelease(tag, apk.getString("browser_download_url"), releaseHighlights(notes))
     } finally {
         connection.disconnect()
@@ -115,7 +153,7 @@ internal suspend fun fetchLatestRelease(): GitHubRelease = withContext(Dispatche
 internal fun downloadRelease(context: Context, release: GitHubRelease): Long {
     val request = DownloadManager.Request(Uri.parse(release.apkUrl))
         .setTitle("JobTracker ${release.tag}")
-        .setDescription("Tap the completed download to install the update")
+        .setDescription("JobTracker update")
         .setMimeType(APK_MIME_TYPE)
         .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
         .setDestinationInExternalFilesDir(
@@ -153,11 +191,19 @@ internal suspend fun awaitReleaseDownload(context: Context, id: Long): Boolean {
             when (status) {
                 DownloadManager.STATUS_SUCCESSFUL -> return true
                 DownloadManager.STATUS_FAILED, null -> return false
-                else -> completed.receive()
+                // A removed download may disappear without a completion broadcast.
+                else -> withTimeoutOrNull(5_000) { completed.receive() }
             }
         }
     } finally {
         context.unregisterReceiver(receiver)
+    }
+}
+
+internal suspend fun removeReleaseDownload(context: Context, id: Long) {
+    withContext(Dispatchers.IO) {
+        // Cleanup should never prevent checking for or installing a newer download.
+        runCatching { context.getSystemService(DownloadManager::class.java).remove(id) }
     }
 }
 

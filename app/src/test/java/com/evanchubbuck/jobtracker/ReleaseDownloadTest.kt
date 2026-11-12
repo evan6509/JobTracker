@@ -7,6 +7,7 @@ import android.content.Intent
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -53,5 +54,20 @@ class ReleaseDownloadTest {
 
         assertFalse(awaitReleaseDownload(context, id))
         assertFalse(awaitReleaseDownload(context, id + 1))
+    }
+
+    @Test fun keepsTheDownloadAndLaterChoiceAcrossStoreInstances() {
+        val context = RuntimeEnvironment.getApplication()
+        val store = ReleaseDownloadStore(context)
+        val download = ReleaseDownload(42, "v1.2.7", "Photo previews")
+        store.save(download)
+        assertEquals(download, ReleaseDownloadStore(context).load())
+
+        val deferred = download.copy(deferred = true)
+        store.save(deferred)
+        assertEquals(deferred, ReleaseDownloadStore(context).load())
+
+        store.save(null)
+        assertNull(ReleaseDownloadStore(context).load())
     }
 }
