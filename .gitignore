@@ -33,3 +33,6 @@ credentials*.json
 # Python release tooling
 __pycache__/
 *.pyc
+
+# Kotlin compiler session state
+/.kotlin/

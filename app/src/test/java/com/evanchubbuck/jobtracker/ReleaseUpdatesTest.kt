@@ -36,6 +36,31 @@ class ReleaseUpdatesTest {
         assertFalse(isNewerRelease("v1.1.1", "1.1.1"))
         assertFalse(isNewerRelease("v1.1.1", "1.1.2"))
         assertFalse(isNewerRelease("unexpected", "1.1.1"))
+        assertFalse(isNewerRelease("v9999999999.0.0", "1.1.1"))
+    }
+
+    @Test fun showsTheFirstThreeReleaseHighlightsWithoutMarkdownOrMetadata() {
+        val notes = """
+            # What's new
+
+            - **Add photos** to jobs.
+            - Open [Settings](https://example.com/settings) to manage sharing.
+            - Keep `drafts` when syncing.
+            - This fourth item is omitted.
+
+            [Full changelog](https://example.com/compare)
+            <!-- jobtracker-version-code: 11 -->
+        """.trimIndent()
+
+        assertEquals(
+            "• Add photos to jobs.\n\n• Open Settings to manage sharing.\n\n• Keep drafts when syncing.",
+            releaseHighlights(notes)
+        )
+    }
+
+    @Test fun acceptsPlainNotesAndIgnoresMetadataOnlyBodies() {
+        assertEquals("Improves photo loading.", releaseHighlights("Improves photo loading."))
+        assertEquals("", releaseHighlights("# What's new\n<!-- release metadata -->"))
     }
 
     @Test fun explainsConnectionFailuresWithoutTechnicalDetails() {

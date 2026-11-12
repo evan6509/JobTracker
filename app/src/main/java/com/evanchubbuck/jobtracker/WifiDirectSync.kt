@@ -18,12 +18,8 @@ import androidx.core.content.ContextCompat
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.net.ServerSocket
 import java.net.Socket
-import java.security.MessageDigest
-import java.security.SecureRandom
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -32,6 +28,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -212,34 +210,34 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
     private suspend fun exchange(connection: Socket, owner: Boolean, outgoingSelection: SyncSelection) {
         val input = DataInputStream(connection.getInputStream().buffered())
         val output = DataOutputStream(connection.getOutputStream().buffered())
-        val nonce = ByteArray(16).also { SecureRandom().nextBytes(it) }
-        val remoteNonce = exchangeSyncHello(input, output, nonce)
-        val sorted = listOf(nonce, remoteNonce).sortedBy { it.toHex() }
-        val digest = MessageDigest.getInstance("SHA-256").digest(sorted[0] + sorted[1])
-        val number = ((digest[0].toInt() and 255) shl 16 or (digest[1].toInt() and 255) shl 8 or (digest[2].toInt() and 255)) % 1_000_000
+        val handshake = exchangeSyncHello(input, output, owner)
+        val verificationCode = syncVerificationCode(handshake)
         val choice = CompletableDeferred<Boolean>()
         withContext(Dispatchers.Main) {
             approval = choice
-            code = "%06d".format(java.util.Locale.US, number)
+            code = verificationCode
             status = "Compare the code on both phones. Confirm on each phone to share the details each phone selected."
         }
         val accepted = withTimeout(120_000) { choice.await() }
-        output.writeBoolean(accepted)
-        output.flush()
         if (!accepted) error("Transfer canceled")
-        require(input.readBoolean()) { "The other phone did not approve the transfer." }
+        handshake.verifyHandshake()
+        val secure = SecureSyncChannel(handshake.toConnectionContext(), input, output)
+        secure.confirm()
         withContext(Dispatchers.Main) { code = null; approval = null; status = "Transferring selected details…" }
         val outgoing = SyncArchive.create(activity, store, outgoingSelection)
         var incoming: File? = null
         try {
             if (owner) {
-                sendFile(output, outgoing)
-                incoming = receiveFile(input)
+                secure.sendFile(outgoing)
+                incoming = secure.receiveFile(activity.cacheDir)
             } else {
-                incoming = receiveFile(input)
-                sendFile(output, outgoing)
+                incoming = secure.receiveFile(activity.cacheDir)
+                secure.sendFile(outgoing)
             }
-            val summary = SyncArchive.merge(activity, store, incoming ?: error("No data was received."))
+            val mergingContext = currentCoroutineContext()
+            val summary = SyncArchive.merge(activity, store, incoming ?: error("No data was received.")) {
+                mergingContext.ensureActive()
+            }
             withContext(Dispatchers.Main) {
                 result = summary
                 status = "Sync complete. Added ${summary.added}, updated ${summary.updated}, received ${summary.photos} photos." +
@@ -252,33 +250,6 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
     }
 
     fun confirm(yes: Boolean) { approval?.complete(yes) }
-
-    private fun sendFile(output: DataOutputStream, file: File) {
-        output.writeLong(file.length())
-        FileInputStream(file).use { it.copyTo(output, bufferSize = 32 * 1024) }
-        output.flush()
-    }
-
-    private fun receiveFile(input: DataInputStream): File {
-        val length = input.readLong()
-        require(length in 1..(1024L * 1024 * 1024)) { "Invalid transfer size." }
-        val file = File.createTempFile("jobtracker-receive-", ".zip", activity.cacheDir)
-        try {
-            FileOutputStream(file).use { output ->
-                var remaining = length
-                val buffer = ByteArray(32 * 1024)
-                while (remaining > 0) {
-                    val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
-                    require(read > 0) { "Transfer ended early." }
-                    output.write(buffer, 0, read)
-                    remaining -= read
-                }
-            }
-            return file
-        } catch (error: Exception) { file.delete(); throw error }
-    }
-
-    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
     private companion object { const val PORT = 39173 }
 }

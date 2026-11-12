@@ -1,9 +1,15 @@
 package com.evanchubbuck.jobtracker
 
 import android.app.DownloadManager
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Environment
+import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import org.json.JSONObject
 import java.io.IOException
 import java.net.ConnectException
@@ -13,9 +19,48 @@ import java.net.URL
 import java.net.UnknownHostException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
-internal data class GitHubRelease(val tag: String, val apkUrl: String)
+internal data class GitHubRelease(val tag: String, val apkUrl: String, val highlights: String = "")
+
+internal data class ReleaseDownload(
+    val id: Long,
+    val tag: String,
+    val highlights: String,
+    val deferred: Boolean = false
+)
+
+internal class ReleaseDownloadStore(context: Context) {
+    private val prefs: SharedPreferences =
+        context.getSharedPreferences("release_download", Context.MODE_PRIVATE)
+
+    fun load(): ReleaseDownload? {
+        val id = prefs.getLong("id", -1)
+        val tag = prefs.getString("tag", null) ?: return null
+        if (id < 0 || !versionPattern.matches(tag)) return null
+        return ReleaseDownload(
+            id, tag, prefs.getString("highlights", "").orEmpty(),
+            prefs.getBoolean("deferred", false)
+        )
+    }
+
+    fun save(download: ReleaseDownload?) {
+        prefs.edit {
+            if (download == null) {
+                clear()
+            } else {
+                putLong("id", download.id)
+                putString("tag", download.tag)
+                putString("highlights", download.highlights)
+                putBoolean("deferred", download.deferred)
+            }
+        }
+    }
+}
+
+private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
 
 internal class UpdateCheckHttpException(val statusCode: Int) : IOException()
 internal class UpdateCheckReleaseException(val userMessage: String) : Exception()
@@ -34,11 +79,32 @@ internal fun updateCheckErrorMessage(error: Throwable): String = when (error) {
 }
 
 private val versionPattern = Regex("v?(\\d+)\\.(\\d+)\\.(\\d+)")
+private val releaseComment = Regex("<!--.*?-->", RegexOption.DOT_MATCHES_ALL)
+private val releaseBullet = Regex("^(?:[-*+]|\\d+[.)])\\s+")
+private val releaseLink = Regex("\\[([^\\]]+)]\\([^)]*\\)")
+
+internal fun releaseHighlights(body: String): String {
+    val lines = body.replace(releaseComment, "").lineSequence()
+        .map(String::trim)
+        .filter { it.isNotBlank() && !it.startsWith('#') && !it.startsWith("[Full changelog](") }
+        .toList()
+    val bullets = lines.filter { releaseBullet.containsMatchIn(it) }
+    return bullets.ifEmpty { lines }.take(3).joinToString("\n\n") { line ->
+        val plainText = line.replace(releaseBullet, "")
+            .replace(releaseLink, "$1")
+            .replace("**", "")
+            .replace("`", "")
+        val text = if (plainText.length > 300) plainText.take(299).trimEnd() + "…" else plainText
+        if (bullets.isNotEmpty()) "• $text" else text
+    }
+}
 
 internal fun isNewerRelease(tag: String, installedVersion: String): Boolean {
-    val latest = versionPattern.matchEntire(tag)?.groupValues?.drop(1)?.map(String::toInt) ?: return false
-    val installed = versionPattern.matchEntire(installedVersion)?.groupValues?.drop(1)?.map(String::toInt) ?: return false
-    return latest.zip(installed).firstOrNull { (a, b) -> a != b }?.let { (a, b) -> a > b } ?: false
+    val latest = versionPattern.matchEntire(tag)?.destructured?.toList() ?: return false
+    val installed = versionPattern.matchEntire(installedVersion)?.destructured?.toList() ?: return false
+    val latestParts = latest.map { it.toIntOrNull() ?: return false }
+    val installedParts = installed.map { it.toIntOrNull() ?: return false }
+    return latestParts.zip(installedParts).firstOrNull { (a, b) -> a != b }?.let { (a, b) -> a > b } ?: false
 }
 
 /** One quiet attempt per app opening; failed checks are left for the next opening. */
@@ -77,7 +143,8 @@ internal suspend fun fetchLatestRelease(): GitHubRelease = withContext(Dispatche
             .map { assets.getJSONObject(it) }
             .firstOrNull { it.optString("name") == expectedName && it.optString("browser_download_url") == expectedUrl }
             ?: throw UpdateCheckReleaseException("An update was found, but its download isn't available yet. Please try again later.")
-        GitHubRelease(tag, apk.getString("browser_download_url"))
+        val notes = release.opt("body") as? String ?: ""
+        GitHubRelease(tag, apk.getString("browser_download_url"), releaseHighlights(notes))
     } finally {
         connection.disconnect()
     }
@@ -86,13 +153,66 @@ internal suspend fun fetchLatestRelease(): GitHubRelease = withContext(Dispatche
 internal fun downloadRelease(context: Context, release: GitHubRelease): Long {
     val request = DownloadManager.Request(Uri.parse(release.apkUrl))
         .setTitle("JobTracker ${release.tag}")
-        .setDescription("Tap the completed download to install the update")
-        .setMimeType("application/vnd.android.package-archive")
+        .setDescription("JobTracker update")
+        .setMimeType(APK_MIME_TYPE)
         .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
         .setDestinationInExternalFilesDir(
             context, Environment.DIRECTORY_DOWNLOADS,
             "JobTracker-${release.tag}-${System.currentTimeMillis()}.apk"
         )
-    val manager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-    return manager.enqueue(request)
+    val manager = context.getSystemService(DownloadManager::class.java)
+    return manager.enqueue(request).also { check(it >= 0) }
+}
+
+internal suspend fun awaitReleaseDownload(context: Context, id: Long): Boolean {
+    val manager = context.getSystemService(DownloadManager::class.java)
+    val completed = Channel<Unit>(Channel.CONFLATED)
+    val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1) == id) {
+                completed.trySend(Unit)
+            }
+        }
+    }
+    ContextCompat.registerReceiver(
+        context, receiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+        ContextCompat.RECEIVER_EXPORTED
+    )
+    try {
+        // Query after registering to cover downloads that finished while the app was away.
+        while (true) {
+            val status = withContext(Dispatchers.IO) {
+                manager.query(DownloadManager.Query().setFilterById(id))?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                    } else null
+                }
+            }
+            when (status) {
+                DownloadManager.STATUS_SUCCESSFUL -> return true
+                DownloadManager.STATUS_FAILED, null -> return false
+                // A removed download may disappear without a completion broadcast.
+                else -> withTimeoutOrNull(5_000) { completed.receive() }
+            }
+        }
+    } finally {
+        context.unregisterReceiver(receiver)
+    }
+}
+
+internal suspend fun removeReleaseDownload(context: Context, id: Long) {
+    withContext(Dispatchers.IO) {
+        // Cleanup should never prevent checking for or installing a newer download.
+        runCatching { context.getSystemService(DownloadManager::class.java).remove(id) }
+    }
+}
+
+internal fun installRelease(context: Context, id: Long) {
+    val manager = context.getSystemService(DownloadManager::class.java)
+    val apk = manager.getUriForDownloadedFile(id) ?: throw IOException("Update APK is unavailable")
+    context.startActivity(
+        Intent(Intent.ACTION_VIEW)
+            .setDataAndType(apk, APK_MIME_TYPE)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    )
 }

@@ -1,0 +1,5 @@
+Google UKEY2
+Copyright 2020 Google LLC
+https://github.com/google/ukey2
+Revision 10fc737aa901e873a3367e7e26b88eb01cd55d69
+Licensed under the Apache License, Version 2.0; see LICENSE-ukey2.txt.

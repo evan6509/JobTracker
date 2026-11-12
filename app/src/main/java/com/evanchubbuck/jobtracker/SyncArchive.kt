@@ -24,22 +24,23 @@ internal object SyncArchive {
     fun create(context: Context, store: JobStore, selection: SyncSelection): File {
         val archive = File.createTempFile("jobtracker-send-", ".zip", context.cacheDir)
         try {
+            val snapshot = store.syncSnapshot()
             val manifest = JSONObject().put("format", SYNC_FORMAT)
             val records = JSONArray()
             val photos = mutableListOf<Pair<String, File>>()
-            store.jobs().filter { selection.jobs[it.id]?.isNotEmpty() == true }.forEachIndexed { index, job ->
+            snapshot.jobs.filter { selection.jobs[it.id]?.isNotEmpty() == true }.forEachIndexed { index, job ->
                 val categories = selection.jobs.getValue(job.id)
-                records.put(selectedRecord(store, job, categories).apply {
+                records.put(selectedRecord(snapshot, job, categories).apply {
                     if (SyncCategory.PHOTOS in categories) put("photos", photoEntries(context, job, "photos/jobs/$index", photos))
 
                 })
             }
             manifest.put("jobs", records)
             val draftRecords = JSONArray()
-            store.drafts().filter { selection.drafts[it.id]?.isNotEmpty() == true }.forEachIndexed { index, draft ->
+            snapshot.drafts.filter { selection.drafts[it.id]?.isNotEmpty() == true }.forEachIndexed { index, draft ->
                 val categories = selection.drafts.getValue(draft.id)
-                draftRecords.put(selectedRecord(store, draft, categories).apply {
-                    put("step", store.draftStep(draft.id))
+                draftRecords.put(selectedRecord(snapshot, draft, categories).apply {
+                    put("step", snapshot.steps.getValue(draft.id))
                     if (SyncCategory.PHOTOS in categories) put("photos", photoEntries(context, draft, "photos/drafts/$index", photos))
                 })
             }
@@ -65,7 +66,7 @@ internal object SyncArchive {
         }
     }
 
-    private fun selectedRecord(store: JobStore, job: Job, categories: Set<SyncCategory>): JSONObject {
+    private fun selectedRecord(snapshot: SyncStoreSnapshot, job: Job, categories: Set<SyncCategory>): JSONObject {
         require(SyncCategory.COSTS !in categories || SyncCategory.INVENTORY in categories) {
             "Select materials before sharing their prices."
         }
@@ -78,12 +79,12 @@ internal object SyncArchive {
         })
         val selected = JSONObject().put("id", job.id).put("createdAt", job.createdAt).put("updatedAt", job.updatedAt)
         categories.forEach { category -> category.fields.forEach { key -> selected.put(key, source.get(key)) } }
-        val stamps = store.fieldStamps(job)
+        val stamps = snapshot.fields.getValue(job.id)
         return JSONObject().put("job", selected)
             .put("fields", JSONArray().apply { categories.forEach { put(it.name) } })
             .apply {
                 if (SyncCategory.COSTS in categories) put("priceUpdated", JSONObject().apply {
-                    store.materialPriceStamps(job).forEach { (id, time) -> put(id, time) }
+                    snapshot.prices.getValue(job.id).forEach { (id, time) -> put(id, time) }
                 })
             }
             .put("fieldUpdated", JSONObject().apply { categories.forEach { category ->
@@ -105,7 +106,14 @@ internal object SyncArchive {
         return names
     }
 
-    fun merge(context: Context, store: JobStore, archive: File): SyncResult {
+    fun merge(context: Context, store: JobStore, archive: File, beforeCommit: () -> Unit = {}): SyncResult {
+        repeat(3) {
+            mergeAttempt(context, store, archive, beforeCommit)?.let { return it }
+        }
+        error("Jobs changed during sync. Please try again.")
+    }
+
+    private fun mergeAttempt(context: Context, store: JobStore, archive: File, beforeCommit: () -> Unit): SyncResult? {
         require(archive.length() in 1..MAX_ARCHIVE) { "Invalid sync transfer size." }
         val created = mutableListOf<File>()
         try {
@@ -124,12 +132,13 @@ internal object SyncArchive {
                 }
                 val manifest = JSONObject(manifestBytes.toString(Charsets.UTF_8.name()))
                 require(manifest.optString("format") == SYNC_FORMAT) {
-                    "Update Job Tracker on both phones to sync materials with optional prices."
+                    "Update Job Tracker on both phones to use encrypted sync."
                 }
                 val records = manifest.getJSONArray("jobs")
                 require(records.length() <= 10000) { "Too many jobs in sync data." }
-                val local = store.jobs()
-                val localDrafts = store.drafts()
+                val snapshot = store.syncSnapshot()
+                val local = snapshot.jobs
+                val localDrafts = snapshot.drafts
                 val merged = local.toMutableList()
                 var added = 0
                 var updated = 0
@@ -146,7 +155,7 @@ internal object SyncArchive {
                     val newPriority = (merged.maxOfOrNull { it.priority } ?: -1) + 1
                     val old = merged.getOrNull(position) ?: localDrafts.firstOrNull { it.id == id }
                         ?.copy(state = Job.PLANNED, priority = newPriority)
-                    val choice = mergeSelectedRecord(context, store, zip, photoComparison, record, old,
+                    val choice = mergeSelectedRecord(context, snapshot, zip, photoComparison, record, old,
                         newPriority, created)
                     photoCount += choice.photos
                     fieldStamps[id] = choice.stamps
@@ -158,7 +167,7 @@ internal object SyncArchive {
                 require(incomingDrafts.length() <= 3) { "Too many drafts in sync data." }
                 val savedIds = merged.map { it.id }.toSet()
                 val combinedDrafts = localDrafts.filterNot { it.id in savedIds }.toMutableList()
-                val draftSteps = combinedDrafts.associate { it.id to store.draftStep(it.id) }.toMutableMap()
+                val draftSteps = combinedDrafts.associate { it.id to snapshot.steps.getValue(it.id) }.toMutableMap()
                 var draftSkipped = false
                 val seenDrafts = mutableSetOf<String>()
                 for (index in 0 until incomingDrafts.length()) {
@@ -173,7 +182,7 @@ internal object SyncArchive {
                         draftSkipped = true
                         continue
                     }
-                    val choice = mergeSelectedRecord(context, store, zip, photoComparison, record, localDraft, 0, created)
+                    val choice = mergeSelectedRecord(context, snapshot, zip, photoComparison, record, localDraft, 0, created)
                     photoCount += choice.photos
                     fieldStamps[id] = choice.stamps
                     priceStamps[id] = choice.priceStamps
@@ -184,27 +193,37 @@ internal object SyncArchive {
                 }
                 val active = merged.filter { it.state == Job.ACTIVE }.maxWithOrNull(compareBy<Job> { it.updatedAt }.thenBy { it.id })?.id
                 val finalJobs = merged.map { if (it.state == Job.ACTIVE && it.id != active) it.copy(state = Job.PLANNED) else it }
-                store.saveSyncState(finalJobs, combinedDrafts, fieldStamps, priceStamps, draftSteps)
-                val retainedPhotos = (finalJobs + combinedDrafts).flatMap { it.photos } + store.recycled().flatMap { it.job.photos }
-                val retainedCanonical = retainedPhotos.mapNotNull { runCatching { File(it).canonicalPath }.getOrNull() }.toSet()
-                val obsolete = (local + localDrafts).flatMap { it.photos }.filter { path ->
-                    runCatching { File(path).canonicalPath !in retainedCanonical }.getOrDefault(false)
+                // A concurrent local write invalidates the snapshot; retry without holding up the UI.
+                if (!store.commitSync(snapshot, finalJobs, combinedDrafts, fieldStamps, priceStamps, draftSteps, beforeCommit)) {
+                    discardUncommittedPhotos(store, created)
+                    return null
                 }
-                // Cleanup must never turn a successfully persisted merge into a rollback of its new files.
-                runCatching { deleteUnreferencedJobPhotos(context, obsolete, retainedPhotos.toSet()) }
+                store.transaction {
+                    val retainedPhotos = (store.jobs() + store.drafts() + store.recycled().map { it.job }).flatMap { it.photos }
+                    val retainedCanonical = retainedPhotos.mapNotNull { runCatching { File(it).canonicalPath }.getOrNull() }.toSet()
+                    val obsolete = (local + localDrafts).flatMap { it.photos }.filter { path ->
+                        runCatching { File(path).canonicalPath !in retainedCanonical }.getOrDefault(false)
+                    }
+                    // Cleanup must never turn a committed merge into a rollback of its new files.
+                    runCatching { deleteUnreferencedJobPhotos(context, obsolete, retainedPhotos.toSet()) }
+                }
                 return SyncResult(added, updated, photoCount, draftSkipped)
             }
         } catch (error: Exception) {
-            // SharedPreferences can expose new values in memory even when its disk commit fails.
-            val retained = runCatching {
-                (store.jobs() + store.drafts() + store.recycled().map { it.job }).flatMap { it.photos }
-                    .mapNotNull { runCatching { File(it).canonicalPath }.getOrNull() }.toSet()
-            }.getOrNull()
-            if (retained != null) created.filter { file ->
-                runCatching { file.canonicalPath !in retained }.getOrDefault(false)
-            }.forEach(File::delete)
+            discardUncommittedPhotos(store, created)
             throw error
         }
+    }
+
+    private fun discardUncommittedPhotos(store: JobStore, created: List<File>) = store.transaction {
+        // SharedPreferences may expose new values even when disk commit fails.
+        val retained = runCatching {
+            (store.jobs() + store.drafts() + store.recycled().map { it.job }).flatMap { it.photos }
+                .mapNotNull { runCatching { File(it).canonicalPath }.getOrNull() }.toSet()
+        }.getOrNull()
+        if (retained != null) created.filter { file ->
+            runCatching { file.canonicalPath !in retained }.getOrDefault(false)
+        }.forEach(File::delete)
     }
 
     private data class SelectedMerge(
@@ -217,7 +236,7 @@ internal object SyncArchive {
     )
 
     private fun mergeSelectedRecord(
-        context: Context, store: JobStore, zip: ZipFile, photoComparison: PhotoComparison, record: JSONObject, old: Job?,
+        context: Context, snapshot: SyncStoreSnapshot, zip: ZipFile, photoComparison: PhotoComparison, record: JSONObject, old: Job?,
         newPriority: Int, created: MutableList<File>
     ): SelectedMerge {
         val array = record.getJSONArray("fields")
@@ -245,9 +264,9 @@ internal object SyncArchive {
         val initial = old ?: Job(id = remote.id, createdAt = remote.createdAt,
             updatedAt = remote.updatedAt, priority = newPriority)
         var merged = initial
-        val stamps = (old?.let(store::fieldStamps)
+        val stamps = (old?.let { snapshot.fields.getValue(it.id) }
             ?: SyncCategory.entries.associateWith { 0L }).toMutableMap()
-        val priceStamps = old?.let(store::materialPriceStamps).orEmpty().toMutableMap()
+        val priceStamps = old?.let { snapshot.prices.getValue(it.id) }.orEmpty().toMutableMap()
         var changed = old == null
         var photoCount = 0
         // Materials must merge before prices; never trust the order of incoming fields.
