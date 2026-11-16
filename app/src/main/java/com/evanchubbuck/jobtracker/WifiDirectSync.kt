@@ -15,6 +15,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
+import com.google.security.cryptauth.lib.securegcm.Ukey2Handshake
 import java.io.Closeable
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -26,12 +27,15 @@ import java.net.Socket
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -181,7 +185,7 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         val active = WifiDirectTransfer()
         transfer = active
         busy = true
-        running.launch {
+        active.start(running) {
             status = "Connected. Opening a secure transfer…"
             try {
                 withContext(Dispatchers.IO) {
@@ -199,11 +203,11 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
                     }
                 }
             } catch (_: TimeoutCancellationException) {
-                if (transfer === active) status = "The code confirmation timed out. Search again on both phones."
+                if (transfer === active && isActive) status = "The code confirmation timed out. Search again on both phones."
             } catch (_: CancellationException) {
-                // The user left the sync screen.
+                // The transfer was canceled.
             } catch (error: Exception) {
-                if (transfer === active) status = "Sync failed: ${error.message ?: "connection lost"}. Try again on both phones."
+                if (transfer === active && isActive) status = "Sync failed: ${error.message ?: "connection lost"}. Try again on both phones."
             } finally {
                 active.close()
                 if (transfer === active) {
@@ -240,11 +244,7 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
             code = verificationCode
             status = "Compare the code on both phones. Confirm on each phone to share the details each phone selected."
         }
-        val accepted = withTimeout(120_000) { active.approval.await() }
-        if (!accepted) error("Transfer canceled")
-        handshake.verifyHandshake()
-        val secure = SecureSyncChannel(handshake.toConnectionContext(), input, output)
-        secure.confirm()
+        val secure = active.waitForPeerApproval(handshake, input, output)
         withContext(Dispatchers.Main) { code = null; status = "Transferring selected details…" }
         val outgoing = SyncArchive.create(activity, store, outgoingSelection)
         var incoming: File? = null
@@ -271,8 +271,18 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         }
     }
 
-    fun confirm(yes: Boolean) {
-        if (code != null) transfer?.approval?.complete(yes)
+    fun confirm() {
+        if (code == null) return
+        if (transfer?.approval?.complete(Unit) == true) {
+            status = "Waiting for the other phone to confirm…"
+        }
+    }
+
+    fun cancelTransfer() {
+        val active = transfer ?: return
+        code = null
+        status = "Transfer canceled. Search again on both phones."
+        active.cancel()
     }
 
     private companion object { const val PORT = 39173 }
@@ -280,9 +290,33 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
 
 /** The transfer may unwind after its screen closes. It only releases sockets it opened. */
 internal class WifiDirectTransfer : Closeable {
-    val approval = CompletableDeferred<Boolean>()
+    val approval = CompletableDeferred<Unit>()
+    private var task: Job? = null
     private val sockets = mutableListOf<Closeable>()
     private var closed = false
+
+    fun start(scope: CoroutineScope, exchange: suspend CoroutineScope.() -> Unit): Job {
+        val job = scope.launch(start = CoroutineStart.LAZY, block = exchange)
+        task = job
+        job.start()
+        return job
+    }
+
+    fun cancel() {
+        task?.cancel()
+        close()
+    }
+
+    suspend fun waitForPeerApproval(
+        handshake: Ukey2Handshake, input: DataInputStream, output: DataOutputStream
+    ): SecureSyncChannel {
+        withTimeout(120_000) { approval.await() }
+        handshake.verifyHandshake()
+        val secure = SecureSyncChannel(handshake.toConnectionContext(), input, output)
+        secure.confirm()
+        currentCoroutineContext().ensureActive()
+        return secure
+    }
 
     @Synchronized
     fun <T : Closeable> ownSocket(socket: T): T {
