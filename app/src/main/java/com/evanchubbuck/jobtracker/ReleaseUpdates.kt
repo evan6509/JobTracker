@@ -11,6 +11,7 @@ import android.os.Environment
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import org.json.JSONObject
+import java.io.FileNotFoundException
 import java.io.IOException
 import java.net.ConnectException
 import java.net.HttpURLConnection
@@ -64,6 +65,7 @@ private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
 
 internal class UpdateCheckHttpException(val statusCode: Int) : IOException()
 internal class UpdateCheckReleaseException(val userMessage: String) : Exception()
+internal class UpdateApkUnavailableException : IOException("Update APK is unavailable")
 
 internal fun updateCheckErrorMessage(error: Throwable): String = when (error) {
     is UnknownHostException, is ConnectException, is SocketTimeoutException ->
@@ -189,7 +191,7 @@ internal suspend fun awaitReleaseDownload(context: Context, id: Long): Boolean {
                 }
             }
             when (status) {
-                DownloadManager.STATUS_SUCCESSFUL -> return true
+                DownloadManager.STATUS_SUCCESSFUL -> return withContext(Dispatchers.IO) { manager.hasReadableApk(id) }
                 DownloadManager.STATUS_FAILED, null -> return false
                 // A removed download may disappear without a completion broadcast.
                 else -> withTimeoutOrNull(5_000) { completed.receive() }
@@ -207,9 +209,19 @@ internal suspend fun removeReleaseDownload(context: Context, id: Long) {
     }
 }
 
-internal fun installRelease(context: Context, id: Long) {
+private fun DownloadManager.hasReadableApk(id: Long): Boolean = try {
+    openDownloadedFile(id)?.use { it.statSize != 0L } ?: false
+} catch (_: FileNotFoundException) {
+    false
+}
+
+internal suspend fun downloadedReleaseUri(context: Context, id: Long): Uri? = withContext(Dispatchers.IO) {
     val manager = context.getSystemService(DownloadManager::class.java)
-    val apk = manager.getUriForDownloadedFile(id) ?: throw IOException("Update APK is unavailable")
+    manager.getUriForDownloadedFile(id)?.takeIf { manager.hasReadableApk(id) }
+}
+
+internal suspend fun installRelease(context: Context, id: Long) {
+    val apk = downloadedReleaseUri(context, id) ?: throw UpdateApkUnavailableException()
     context.startActivity(
         Intent(Intent.ACTION_VIEW)
             .setDataAndType(apk, APK_MIME_TYPE)

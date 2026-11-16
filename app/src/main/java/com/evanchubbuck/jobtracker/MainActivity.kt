@@ -144,6 +144,12 @@ class MainActivity : ComponentActivity() {
         val scanPreview = remember(scanRaw) { runCatching { if (scanRaw.isBlank()) null else JSONObject(scanRaw).getJSONObject("job").toJob() }.getOrNull() }
         val scanSource = remember(scanRaw) { runCatching { JSONObject(scanRaw).getString("source") }.getOrDefault("") }
         val scope = rememberCoroutineScope()
+        fun discardDownload(id: Long) {
+            if (releaseDownload?.id != id) return
+            updateSnackbar.currentSnackbarData?.dismiss()
+            trackDownload(null)
+            scope.launch { removeReleaseDownload(this@MainActivity, id) }
+        }
         DisposableEffect(releaseUpdatesEnabled) {
             fun checkOnOpen() {
                 val pending = releaseDownload?.takeIf { isNewerRelease(it.tag, installedVersion) }
@@ -176,8 +182,7 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(download?.id) {
             if (download == null) return@LaunchedEffect
             if (!isNewerRelease(download.tag, installedVersion)) {
-                trackDownload(null)
-                scope.launch { removeReleaseDownload(this@MainActivity, download.id) }
+                discardDownload(download.id)
                 return@LaunchedEffect
             }
             lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -190,14 +195,14 @@ class MainActivity : ComponentActivity() {
                 }
                 if (releaseDownload?.id != download.id) return@repeatOnLifecycle
                 downloadReady = ready
-                updateSnackbar.currentSnackbarData?.dismiss()
-                if (!ready) {
+                if (ready) {
+                    updateSnackbar.currentSnackbarData?.dismiss()
+                } else {
                     val deferred = releaseDownload?.deferred == true
-                    trackDownload(null)
+                    discardDownload(download.id)
                     if (!deferred) {
                         message = "Couldn't finish downloading ${download.tag}. Check for updates to try again."
                     }
-                    scope.launch { removeReleaseDownload(this@MainActivity, download.id) }
                 }
             }
         }
@@ -450,7 +455,12 @@ class MainActivity : ComponentActivity() {
                     val release = fetchLatestRelease()
                     val saved = releaseDownload
                     if (saved != null && downloadReady && release.tag == saved.tag) {
-                        trackDownload(saved.copy(deferred = false))
+                        if (downloadedReleaseUri(this@MainActivity, saved.id) != null && releaseDownload?.id == saved.id) {
+                            trackDownload(saved.copy(deferred = false))
+                        } else {
+                            discardDownload(saved.id)
+                            latestRelease = release
+                        }
                     } else {
                         latestRelease = release
                     }
@@ -506,9 +516,7 @@ class MainActivity : ComponentActivity() {
                                         } else if (!downloadReady && !download.deferred) {
                                             DropdownMenuItem(text = { Text("Cancel update download") }, onClick = {
                                                 menuExpanded = false
-                                                updateSnackbar.currentSnackbarData?.dismiss()
-                                                trackDownload(null)
-                                                scope.launch { removeReleaseDownload(this@MainActivity, download.id) }
+                                                discardDownload(download.id)
                                             })
                                         }
                                     }
@@ -744,10 +752,17 @@ class MainActivity : ComponentActivity() {
                 confirmButton = {
                     TextButton(onClick = {
                         dismiss()
-                        try {
-                            installRelease(this@MainActivity, download.id)
-                        } catch (_: Exception) {
-                            message = "Couldn't open the installer. Open Install downloaded update from the menu to try again."
+                        scope.launch {
+                            try {
+                                installRelease(this@MainActivity, download.id)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: UpdateApkUnavailableException) {
+                                discardDownload(download.id)
+                                message = "The update file is missing. Check for updates to download it again."
+                            } catch (_: Exception) {
+                                message = "Couldn't open the installer. Open Install downloaded update from the menu to try again."
+                            }
                         }
                     }) { Text("Install now") }
                 },
