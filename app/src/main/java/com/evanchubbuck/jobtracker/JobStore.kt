@@ -432,9 +432,11 @@ internal sealed interface DraftFinishResult {
     data object Missing : DraftFinishResult
 }
 
-private fun Job.withValidSyncRevisions(): Job =
-    if (createdAt in syncRevisionRange && updatedAt in syncRevisionRange) this
-    else copy(createdAt = storedSyncRevision(createdAt), updatedAt = storedSyncRevision(updatedAt))
+private fun Job.withValidSyncRevisions(): Job {
+    val created = storedSyncRevision(createdAt)
+    val updated = storedSyncRevision(updatedAt)
+    return if (created == createdAt && updated == updatedAt) this else copy(createdAt = created, updatedAt = updated)
+}
 
 private fun Person.toJson() = JSONObject().put("name", name).put("phone", phone).put("work", work)
 private fun JSONObject.toPerson() = Person(optString("name"), optString("phone"), optString("work"))

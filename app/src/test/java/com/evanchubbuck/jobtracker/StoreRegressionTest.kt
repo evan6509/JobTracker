@@ -254,16 +254,38 @@ class StoreRegressionTest {
                 "fieldUpdated" to SyncCategory.COSTS.name,
                 "priceUpdated" to row.id
             )
-            for ((section, field) in revisionFields) {
-                val payload = JSONObject(manifest)
-                payload.getJSONArray("jobs").getJSONObject(0).getJSONObject(section).put(field, Long.MAX_VALUE - 1)
-                ZipOutputStream(archive.outputStream()).use { zip ->
-                    zip.putNextEntry(ZipEntry("manifest.json"))
-                    zip.write(payload.toString().toByteArray())
+            for (invalid in listOf(253_402_300_799_999L, Long.MAX_VALUE - 1)) {
+                for ((section, field) in revisionFields) {
+                    val payload = JSONObject(manifest)
+                    payload.getJSONArray("jobs").getJSONObject(0).getJSONObject(section).put(field, invalid)
+                    ZipOutputStream(archive.outputStream()).use { zip ->
+                        zip.putNextEntry(ZipEntry("manifest.json"))
+                        zip.write(payload.toString().toByteArray())
+                    }
+                    assertThrows(IllegalArgumentException::class.java) { SyncArchive.merge(tc, target, archive) }
+                    assertEquals(listOf(local), target.jobs())
                 }
-                assertThrows(IllegalArgumentException::class.java) { SyncArchive.merge(tc, target, archive) }
-                assertEquals(listOf(local), target.jobs())
             }
+        } finally { archive.delete() }
+    }
+
+    @Test fun editsAdvancePastHighestPeerRevisionAndSurviveReplay() = phones { sc, source, tc, target ->
+        val peerRevision = peerSyncRevisionLimit()
+        val material = InventoryItem(id = "material", name = "Paint", price = "90")
+        val job = Job(id = "shared", title = "Z", updatedAt = peerRevision, inventory = listOf(material))
+        source.saveJobs(listOf(job))
+        val archive = SyncArchive.create(sc, source, SyncSelection(jobs = mapOf(job.id to SyncCategory.entries.toSet())))
+        try {
+            SyncArchive.merge(tc, target, archive)
+            val before = target.jobs().single()
+            val edited = before.copy(title = "A", inventory = listOf(material.copy(price = "20")),
+                updatedAt = System.currentTimeMillis())
+            target.applyJobChanges(listOf(before), listOf(edited))
+            assertTrue(target.fieldStamps(edited).getValue(SyncCategory.NAME) > peerRevision)
+            assertTrue(target.materialPriceStamps(edited).getValue(material.id) > peerRevision)
+            SyncArchive.merge(tc, target, archive)
+            assertEquals("A", target.jobs().single().title)
+            assertEquals("20", target.jobs().single().inventory.single().price)
         } finally { archive.delete() }
     }
 
@@ -274,7 +296,7 @@ class StoreRegressionTest {
         val prefs = sc.getSharedPreferences("job_tracker", 0)
         prefs.edit()
             .putString("jobs", JSONArray().put(normal.toJson()).put(invalid.toJson()).toString())
-            .putString("field_updated_invalid", JSONObject().put(SyncCategory.NAME.name, Long.MAX_VALUE).toString())
+            .putString("field_updated_invalid", JSONObject().put(SyncCategory.NAME.name, 253_402_300_799_999L).toString())
             .putString("price_updated_invalid", JSONObject().put("material", Long.MAX_VALUE).toString())
             .commit()
         source.applyJobChanges(listOf(normal), listOf(normal.copy(title = "Updated", updatedAt = 2000)))

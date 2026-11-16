@@ -362,7 +362,9 @@ internal object SyncArchive {
     private fun JSONObject.checkedRevision(key: String): Long {
         val value = get(key)
         require(value is Int || value is Long) { "Invalid date in sync data." }
-        return (value as Number).toLong().also { require(it in syncRevisionRange) { "Invalid date in sync data." } }
+        return (value as Number).toLong().also {
+            require(it in 0L..peerSyncRevisionLimit()) { "Invalid date in sync data. Check the date on both phones." }
+        }
     }
 
     private fun applyCategory(base: Job, remote: Job, category: SyncCategory): Job = when (category) {

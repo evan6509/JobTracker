@@ -1,13 +1,16 @@
 package com.evanchubbuck.jobtracker
 
-// Revisions are epoch milliseconds. Bound them to the end of year 9999.
-internal val syncRevisionRange = 0L..253_402_300_799_999L
+private const val MILLIS_PER_DAY = 86_400_000L
+private const val MAX_PEER_CLOCK_LEAD_MS = 3650L * MILLIS_PER_DAY
+
+internal fun peerSyncRevisionLimit(): Long =
+    System.currentTimeMillis().coerceIn(0L, Long.MAX_VALUE / 2) + MAX_PEER_CLOCK_LEAD_MS
 
 internal fun storedSyncRevision(value: Long, fallback: Long = 0L): Long =
-    if (value in syncRevisionRange) value else fallback
+    // Keep locally advanced revisions above the incoming limit readable.
+    if (value in 0L..(peerSyncRevisionLimit() + MILLIS_PER_DAY)) value else fallback
 
-internal fun nextSyncRevision(value: Long): Long =
-    value.coerceIn(0L, syncRevisionRange.last - 1) + 1
+internal fun nextSyncRevision(value: Long): Long = value + 1
 
 internal enum class SyncCategory(val label: String, val fields: List<String>) {
     NAME("Job name", listOf("title")),
