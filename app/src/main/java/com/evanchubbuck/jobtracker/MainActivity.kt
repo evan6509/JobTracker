@@ -276,13 +276,15 @@ class MainActivity : ComponentActivity() {
         }
         fun changeEditor(before: Job, value: Job): Job? {
             val changed = value.copy(updatedAt = System.currentTimeMillis())
-            if (editingId.isBlank()) {
-                editor = store.applyDraftChange(before, changed)
-                drafts = store.drafts()
-            } else {
-                store.applyJobChanges(listOf(before), listOf(changed))
-                jobs = store.jobs()
-                editor = jobs.firstOrNull { it.id == editingId }
+            val draft = editingId.isBlank()
+            val applied = store.applyEditorChange(before, changed, draft)
+            editor = applied?.job
+            if (draft) drafts = store.drafts() else jobs = store.jobs()
+            if (applied == null) {
+                message = "This job or draft is no longer available."
+            } else if (applied.conflicts.isNotEmpty()) {
+                val sections = applied.conflicts.joinToString(", ") { it.label }
+                message = "$sections changed during sync. Review the latest details and try your edit again."
             }
             return editor
         }
@@ -299,11 +301,13 @@ class MainActivity : ComponentActivity() {
         fun openEditor(id: String = "", section: Int = 0) {
             editingId = id
             if (id.isBlank()) {
-                if (drafts.size >= 3) { screen = "drafts"; return }
-                val newDraft = Job()
+                val newDraft = store.createDraft()
+                drafts = store.drafts()
+                if (newDraft == null) {
+                    screen = "drafts"
+                    return
+                }
                 activeDraftId = newDraft.id
-                store.saveDraft(newDraft)
-                drafts = drafts + newDraft
                 editor = newDraft
                 step = 0
             } else {

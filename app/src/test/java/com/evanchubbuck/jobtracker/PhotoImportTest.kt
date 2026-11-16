@@ -35,9 +35,9 @@ class PhotoImportTest {
         val folder = Files.createTempDirectory("photo-attach").toFile()
         try {
             val copy: (Int) -> String = { java.io.File(folder, "$it.jpg").apply { writeText("photo") }.path }
-            importJobPhotos(listOf(1, 2), copy) { false }
+            assertEquals(0, importJobPhotos(listOf(1, 2), copy) { false })
             assertTrue(folder.listFiles()!!.isEmpty())
-            importJobPhotos(listOf(1, 2), copy) { true }
+            assertEquals(2, importJobPhotos(listOf(1, 2), copy) { true })
             assertEquals(2, folder.listFiles()!!.size)
         } finally { folder.deleteRecursively() }
     }

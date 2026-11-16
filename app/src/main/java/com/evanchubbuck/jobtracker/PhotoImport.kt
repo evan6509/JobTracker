@@ -19,7 +19,7 @@ internal suspend fun <T> importJobPhotos(items: List<T>, copy: (T) -> String?, a
         }
         currentCoroutineContext().ensureActive()
         attached = attach(created)
-        return created.size
+        return if (attached) created.size else 0
     } finally {
         if (!attached) created.forEach { File(it).delete() }
     }

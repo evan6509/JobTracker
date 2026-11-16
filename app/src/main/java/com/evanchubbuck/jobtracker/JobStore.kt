@@ -213,6 +213,11 @@ class JobStore(context: Context) {
         prefs.edit().putInt("draft_step_$id", step.coerceIn(0, 7)).apply()
     }
 
+    internal fun createDraft(): Job? = transaction {
+        if (drafts().size >= 3) return null
+        Job().also(::saveDraft)
+    }
+
     fun saveDraft(job: Job): Unit = transaction {
         val existing = drafts()
         require(existing.any { it.id == job.id } || existing.size < 3) { "Only three drafts can be saved." }
@@ -353,10 +358,15 @@ class JobStore(context: Context) {
         return maxOf(requested, nextSyncRevision(previous))
     }
 
-    internal fun applyDraftChange(before: Job, edited: Job): Job? = transaction {
-        val latest = drafts().firstOrNull { it.id == before.id } ?: return null
-        saveDraft(applyLocalEdit(before, edited, latest))
-        return drafts().first { it.id == before.id }
+    internal fun applyEditorChange(before: Job, edited: Job, draft: Boolean): LocalEditResult? = transaction {
+        val records = if (draft) drafts() else jobs()
+        val latest = records.firstOrNull { it.id == before.id } ?: return null
+        val change = applyLocalEdit(before, edited, latest)
+        if (change.job == latest) return change
+
+        if (draft) saveDraft(change.job) else saveJobs(records.map { if (it.id == latest.id) change.job else it })
+        val saved = if (draft) drafts() else jobs()
+        return change.copy(job = saved.first { it.id == latest.id })
     }
 
     /** Apply only the user's changes to the latest saved snapshot; preserve concurrent sync additions. */
@@ -370,7 +380,7 @@ class JobStore(context: Context) {
             when {
                 old == null -> latest
                 edited == null -> null
-                else -> applyLocalEdit(old, edited, latest)
+                else -> applyLocalEdit(old, edited, latest).job
             }
         } + desired.filter { it.id !in baseline && current.none { currentJob -> currentJob.id == it.id } }
         val activated = desired.firstOrNull { it.state == Job.ACTIVE && baseline[it.id]?.state != Job.ACTIVE }?.id

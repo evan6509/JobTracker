@@ -309,7 +309,7 @@ class StoreRegressionTest {
         val before = Job(id = "draft", title = "Old", address = "Old", updatedAt = 1000)
         target.saveDraft(before)
         target.saveDraft(before.copy(address = "Received", updatedAt = 5000))
-        val edited = requireNotNull(target.applyDraftChange(before, before.copy(title = "Local", updatedAt = 500)))
+        val edited = requireNotNull(target.applyEditorChange(before, before.copy(title = "Local", updatedAt = 500), draft = true)).job
         assertEquals("Received", edited.address)
         assertEquals("Local", edited.title)
         assertTrue(edited.updatedAt > 5000)
@@ -342,7 +342,7 @@ class StoreRegressionTest {
                 assertTrue(localPhotos.none { it.exists() })
                 val edit = before.copy(photos = listOf(localPhotos.last().path), updatedAt = 3000)
                 val saved = if (draft) {
-                    requireNotNull(target.applyDraftChange(before, edit))
+                    requireNotNull(target.applyEditorChange(before, edit, draft = true)).job
                 } else {
                     target.applyJobChanges(listOf(before), listOf(edit))
                     target.jobs().single()
@@ -366,6 +366,71 @@ class StoreRegressionTest {
         val edit = before.copy(inventory = listOf(tiles.copy(quantity = "2"), removedByPeer, localItem), updatedAt = 3000)
         target.applyJobChanges(listOf(before), listOf(edit))
         assertEquals(listOf(receivedTiles.copy(quantity = "2"), peerItem, localItem), target.jobs().single().inventory)
+    }
+
+    @Test fun stalePeopleEditsRefreshListsAndCanBeRetriedOnReceivedValues() = phones { sc, source, tc, target ->
+        val client = Person("Alice", "3125550100")
+        val worker = Person("Erin", "3125550101", "Paint")
+        val before = Job(id = "shared", clients = listOf(client), workers = listOf(worker), updatedAt = 1000)
+        val peer = before.copy(
+            clients = listOf(client.copy(phone = "3125550102"), Person("Bob")),
+            workers = listOf(worker.copy(phone = "3125550103"), Person("Jo", work = "Prep")),
+            updatedAt = 2000
+        )
+        target.saveJobs(listOf(before))
+        source.saveJobs(listOf(peer))
+        transfer(sc, source, tc, target)
+        val staleEdit = before.copy(clients = listOf(client.copy(name = "Alicia")),
+            workers = listOf(worker.copy(work = "Tile")), updatedAt = 3000)
+        val conflict = requireNotNull(target.applyEditorChange(before, staleEdit, draft = false))
+        assertEquals(listOf(SyncCategory.CLIENTS, SyncCategory.WORKERS), conflict.conflicts)
+        assertEquals(peer.clients, conflict.job.clients)
+        assertEquals(peer.workers, conflict.job.workers)
+        assertEquals(conflict.job, target.jobs().single())
+
+        val refreshed = conflict.job
+        val retry = refreshed.copy(
+            clients = listOf(refreshed.clients[0].copy(name = "Alicia"), refreshed.clients[1]),
+            workers = listOf(refreshed.workers[0].copy(work = "Tile"), refreshed.workers[1]),
+            updatedAt = 3000
+        )
+        val applied = requireNotNull(target.applyEditorChange(refreshed, retry, draft = false))
+        assertTrue(applied.conflicts.isEmpty())
+        assertEquals(retry.clients, target.jobs().single().clients)
+        assertEquals(retry.workers, target.jobs().single().workers)
+    }
+
+    @Test fun staleEndDateEditKeepsSyncedScheduleAndRejectsInvalidRange() = phones { sc, source, tc, target ->
+        val before = Job(id = "shared", startDate = "2026-07-01", startTime = "09:00",
+            timeZone = "America/Chicago", updatedAt = 1000)
+        target.saveJobs(listOf(before))
+        val incoming = before.copy(startDate = "2026-07-03", startTime = "10:00",
+            timeZone = "America/New_York", updatedAt = 2000)
+        source.saveJobs(listOf(incoming))
+        transfer(sc, source, tc, target)
+
+        val invalid = requireNotNull(target.applyEditorChange(before, before.copy(endDate = "2026-07-02"), draft = false))
+        assertEquals(listOf(SyncCategory.SCHEDULE), invalid.conflicts)
+        assertEquals(incoming.syncValue(SyncCategory.SCHEDULE), invalid.job.syncValue(SyncCategory.SCHEDULE))
+        val valid = requireNotNull(target.applyEditorChange(before, before.copy(endDate = "2026-07-04"), draft = false))
+        assertTrue(valid.conflicts.isEmpty())
+        assertEquals(incoming.copy(endDate = "2026-07-04").syncValue(SyncCategory.SCHEDULE),
+            valid.job.syncValue(SyncCategory.SCHEDULE))
+    }
+
+    @Test fun creatingDraftChecksCapacityAfterSyncFillsLastSlot() = phones { sc, source, tc, target ->
+        assertNotNull(target.createDraft())
+        assertNotNull(target.createDraft())
+        val screenDrafts = target.drafts()
+        val received = Job(id = "received", title = "Third draft")
+        source.saveDraft(received)
+        val archive = SyncArchive.create(sc, source, SyncSelection(drafts = mapOf(received.id to setOf(SyncCategory.NAME))))
+        try {
+            SyncArchive.merge(tc, target, archive)
+            assertEquals(2, screenDrafts.size)
+            assertNull(target.createDraft())
+            assertEquals(screenDrafts.map { it.id } + received.id, target.drafts().map { it.id })
+        } finally { archive.delete() }
     }
 
     @Test fun finishingDraftUsesLatestReceivedDetailsAndPhoto() = phones { sc, source, tc, target ->
