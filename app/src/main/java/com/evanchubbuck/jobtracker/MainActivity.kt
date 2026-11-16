@@ -240,8 +240,9 @@ class MainActivity : ComponentActivity() {
             store.applyJobChanges(jobs, list)
             jobs = store.jobs()
         }
-        fun deleteUnusedPhotos(paths: List<String>, usedPhotos: Set<String>) {
-            val retainedPhotos = usedPhotos + store.recycled().flatMap { it.job.photos }
+        fun deleteUnusedPhotos(paths: List<String>) = store.transaction {
+            val jobsWithPhotos = store.jobs() + store.drafts() + store.recycled().map { it.job }
+            val retainedPhotos = jobsWithPhotos.flatMap { it.photos }.toSet()
             deleteUnreferencedJobPhotos(this@MainActivity, paths, retainedPhotos)
         }
         fun discardDraft(id: String) {
@@ -271,8 +272,7 @@ class MainActivity : ComponentActivity() {
         fun deleteRecycledForever(ids: Set<String>) {
             val removed = store.deleteRecycled(ids)
             recycled = store.recycled()
-            val usedPhotos = jobs.flatMap { it.photos }.toSet() + drafts.flatMap { it.photos }
-            deleteUnusedPhotos(removed.flatMap { it.job.photos }, usedPhotos)
+            deleteUnusedPhotos(removed.flatMap { it.job.photos })
         }
         fun changeEditor(before: Job, value: Job): Job? {
             val changed = value.copy(updatedAt = System.currentTimeMillis())
@@ -415,8 +415,7 @@ class MainActivity : ComponentActivity() {
             if (result.resultCode == RESULT_OK) result.data?.getStringExtra(PhotoCaptureActivity.PHOTO_PATH)?.let { path ->
                 val updated = attachCapturedPhoto(this@MainActivity, store, cameraJobId, path)
                 if (updated == null) {
-                    val used = (store.jobs() + store.drafts()).flatMap { it.photos }.toSet()
-                    deleteUnusedPhotos(listOf(path), used)
+                    deleteUnusedPhotos(listOf(path))
                     message = "This job or draft is no longer available. The photo wasn't added."
                 } else {
                     jobs = store.jobs()
@@ -618,9 +617,10 @@ class MainActivity : ComponentActivity() {
                         onPickPhotos = { picker.launch("image/*") }, onPhoto = { photoPath = it },
                         onTakePhoto = { cameraJobId = current.id; photoCamera.launch(Intent(this@MainActivity, PhotoCaptureActivity::class.java)) },
                         onRemovePhoto = { path ->
-                            changeEditor(current, current.copy(photos = current.photos - path))
-                            val usedPhotos = jobs.flatMap { it.photos }.toSet() + drafts.flatMap { it.photos }
-                            deleteUnusedPhotos(listOf(path), usedPhotos)
+                            store.transaction {
+                                changeEditor(current, current.copy(photos = current.photos - path))
+                                deleteUnusedPhotos(listOf(path))
+                            }
                         }, onNavigate = { navigate(current.address) },
                         onFinish = {
                             if (editingId.isBlank()) {

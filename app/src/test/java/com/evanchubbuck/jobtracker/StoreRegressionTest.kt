@@ -294,6 +294,58 @@ class StoreRegressionTest {
         assertTrue(target.fieldStamps(edited).getValue(SyncCategory.NAME) > 5000)
     }
 
+    @Test fun stalePhotoRemovalKeepsNewlySyncedPhotosOnJobsAndDrafts() = phones { sc, source, tc, target ->
+        val sourceFolder = File(sc.filesDir, "photos").apply { mkdirs() }
+        val targetFolder = File(tc.filesDir, "photos").apply { mkdirs() }
+        for (draft in listOf(false, true)) {
+            val id = if (draft) "draft" else "job"
+            val localPhotos = listOf("A", "B").map { name ->
+                File(targetFolder, "$id-$name.jpg").apply { writeText(name) }
+            }
+            val peerPhoto = File(sourceFolder, "$id-C.jpg").apply { writeText("C") }
+            val before = Job(id = id, photos = localPhotos.map { it.path }, updatedAt = 1000)
+            val incoming = before.copy(photos = listOf(peerPhoto.path), updatedAt = 2000)
+            val selection = mapOf(id to setOf(SyncCategory.PHOTOS))
+            if (draft) {
+                target.saveDraft(before)
+                source.saveDraft(incoming)
+            } else {
+                target.saveJobs(listOf(before))
+                source.saveJobs(listOf(incoming))
+            }
+            val archive = SyncArchive.create(sc, source,
+                if (draft) SyncSelection(drafts = selection) else SyncSelection(jobs = selection))
+            try {
+                SyncArchive.merge(tc, target, archive)
+                assertTrue(localPhotos.none { it.exists() })
+                val edit = before.copy(photos = listOf(localPhotos.last().path), updatedAt = 3000)
+                val saved = if (draft) {
+                    requireNotNull(target.applyDraftChange(before, edit))
+                } else {
+                    target.applyJobChanges(listOf(before), listOf(edit))
+                    target.jobs().single()
+                }
+                assertEquals("C", File(saved.photos.single()).readText())
+            } finally { archive.delete() }
+        }
+    }
+
+    @Test fun staleMaterialEditsKeepSyncedItemsPropertiesAndPrices() = phones { sc, source, tc, target ->
+        val tiles = InventoryItem(id = "tiles", name = "Tiles", quantity = "1", price = "10", notes = "Old")
+        val removeLocally = InventoryItem(id = "brush", name = "Brush")
+        val removedByPeer = InventoryItem(id = "tape", name = "Tape")
+        val peerItem = InventoryItem(id = "paint", name = "Paint", price = "25")
+        val localItem = InventoryItem(id = "roller", name = "Roller", price = "5")
+        val before = Job(id = "shared", inventory = listOf(tiles, removeLocally, removedByPeer), updatedAt = 1000)
+        target.saveJobs(listOf(before))
+        val receivedTiles = tiles.copy(price = "30", notes = "New")
+        source.saveJobs(listOf(before.copy(inventory = listOf(receivedTiles, removeLocally, peerItem), updatedAt = 2000)))
+        transfer(sc, source, tc, target)
+        val edit = before.copy(inventory = listOf(tiles.copy(quantity = "2"), removedByPeer, localItem), updatedAt = 3000)
+        target.applyJobChanges(listOf(before), listOf(edit))
+        assertEquals(listOf(receivedTiles.copy(quantity = "2"), peerItem, localItem), target.jobs().single().inventory)
+    }
+
     @Test fun finishingDraftUsesLatestReceivedDetailsAndPhoto() = phones { sc, source, tc, target ->
         val localPhoto = File(File(tc.filesDir, "photos").apply { mkdirs() }, "local.jpg").apply { writeText("old") }
         val remotePhoto = File(File(sc.filesDir, "photos").apply { mkdirs() }, "remote.jpg").apply { writeText("new") }
