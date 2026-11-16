@@ -34,8 +34,9 @@ internal data class ReleaseDownload(
 )
 
 internal class ReleaseDownloadStore(context: Context) {
+    private val appContext = context.applicationContext
     private val prefs: SharedPreferences =
-        context.getSharedPreferences("release_download", Context.MODE_PRIVATE)
+        appContext.getSharedPreferences("release_download", Context.MODE_PRIVATE)
 
     fun load(): ReleaseDownload? {
         val id = prefs.getLong("id", -1)
@@ -47,10 +48,18 @@ internal class ReleaseDownloadStore(context: Context) {
         )
     }
 
-    fun save(download: ReleaseDownload?) {
+    fun save(download: ReleaseDownload?) = synchronized(removalLock) {
+        val previousId = prefs.getLong("id", -1)
         prefs.edit {
+            // Keep the old ID in the same preference update that clears or replaces it.
+            if (previousId >= 0 && previousId != download?.id) {
+                putStringSet(PENDING_REMOVALS, pendingRemovals() + previousId.toString())
+            }
             if (download == null) {
-                clear()
+                remove("id")
+                remove("tag")
+                remove("highlights")
+                remove("deferred")
             } else {
                 putLong("id", download.id)
                 putString("tag", download.tag)
@@ -58,6 +67,34 @@ internal class ReleaseDownloadStore(context: Context) {
                 putBoolean("deferred", download.deferred)
             }
         }
+    }
+
+    suspend fun removePendingDownloads() {
+        val ids = pendingRemovals()
+        for (key in ids) {
+            val id = key.toLong()
+            val removed = withContext(Dispatchers.IO) {
+                try {
+                    // Zero rows means Android has already removed this download.
+                    appContext.getSystemService(DownloadManager::class.java).remove(id)
+                    true
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: RuntimeException) {
+                    false
+                }
+            }
+            if (removed) synchronized(removalLock) {
+                prefs.edit { putStringSet(PENDING_REMOVALS, pendingRemovals() - key) }
+            }
+        }
+    }
+
+    private fun pendingRemovals(): Set<String> = prefs.getStringSet(PENDING_REMOVALS, null).orEmpty()
+
+    private companion object {
+        const val PENDING_REMOVALS = "pending_removals"
+        val removalLock = Any()
     }
 }
 
@@ -199,13 +236,6 @@ internal suspend fun awaitReleaseDownload(context: Context, id: Long): Boolean {
         }
     } finally {
         context.unregisterReceiver(receiver)
-    }
-}
-
-internal suspend fun removeReleaseDownload(context: Context, id: Long) {
-    withContext(Dispatchers.IO) {
-        // Cleanup should never prevent checking for or installing a newer download.
-        runCatching { context.getSystemService(DownloadManager::class.java).remove(id) }
     }
 }
 

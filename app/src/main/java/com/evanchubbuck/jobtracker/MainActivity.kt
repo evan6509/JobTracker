@@ -148,7 +148,11 @@ class MainActivity : ComponentActivity() {
             if (releaseDownload?.id != id) return
             updateSnackbar.currentSnackbarData?.dismiss()
             trackDownload(null)
-            scope.launch { removeReleaseDownload(this@MainActivity, id) }
+        }
+        LaunchedEffect(releaseUpdatesEnabled, download?.id) {
+            if (releaseUpdatesEnabled) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                releaseDownloads.removePendingDownloads()
+            }
         }
         DisposableEffect(releaseUpdatesEnabled) {
             fun checkOnOpen() {
@@ -721,11 +725,7 @@ class MainActivity : ComponentActivity() {
                         if (newer) {
                             try {
                                 val id = downloadRelease(this@MainActivity, release)
-                                val previous = releaseDownload
                                 trackDownload(ReleaseDownload(id, release.tag, release.highlights))
-                                if (previous != null) {
-                                    scope.launch { removeReleaseDownload(this@MainActivity, previous.id) }
-                                }
                             } catch (_: Exception) {
                                 message = "Couldn't start the update download. Please try again."
                             }
