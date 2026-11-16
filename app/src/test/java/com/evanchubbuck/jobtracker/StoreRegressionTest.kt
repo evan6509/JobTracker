@@ -19,6 +19,9 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], manifest = Config.NONE)
@@ -170,6 +173,114 @@ class StoreRegressionTest {
             assertEquals(1, saved.photos.size)
             assertEquals(saved.photos.toSet(), File(tc.filesDir, "photos").listFiles()!!.map { it.path }.toSet())
         } finally { archive.delete() }
+    }
+
+    @Test fun retryKeepsConcurrentFieldAndPriceEditsAgainstNewerPeerAndLaterSync() = phones { sc, source, tc, target ->
+        val tiles = InventoryItem(id = "tiles", name = "Tiles", price = "10")
+        val paint = InventoryItem(id = "paint", name = "Paint", price = "5")
+        val original = Job(id = "shared", title = "Original", inventory = listOf(tiles, paint), updatedAt = 1000)
+        target.saveJobs(listOf(original))
+        source.saveJobs(listOf(original.copy(title = "Peer name", address = "Peer site", updatedAt = 9000,
+            inventory = listOf(tiles.copy(price = "30"), paint.copy(price = "15")))))
+        val selection = SyncSelection(jobs = mapOf(original.id to SyncCategory.entries.toSet()))
+        val archive = SyncArchive.create(sc, source, selection)
+        var attempts = 0
+        try {
+            SyncArchive.merge(tc, target, archive) {
+                if (attempts++ == 0) {
+                    target.saveJobs(listOf(original.copy(title = "Local name", updatedAt = 2000,
+                        inventory = listOf(tiles.copy(price = "25"), paint))))
+                }
+            }
+            assertEquals(2, attempts)
+            SyncArchive.merge(tc, target, archive)
+            transfer(tc, target, sc, source)
+            for (store in listOf(source, target)) {
+                val saved = store.jobs().single()
+                assertEquals("Local name", saved.title)
+                assertEquals("Peer site", saved.address)
+                assertEquals(listOf("25", "15"), saved.inventory.map { it.price })
+            }
+        } finally { archive.delete() }
+    }
+
+    @Test fun retryDoesNotResurrectRecycledRecordsOrResetLocallyChangedDraftStep() = phones { sc, source, tc, target ->
+        val job = Job(id = "job", updatedAt = 1000)
+        val recycledDraft = Job(id = "removed-draft", updatedAt = 1000)
+        val draft = Job(id = "kept-draft", updatedAt = 1000)
+        target.saveJobs(listOf(job))
+        target.saveDraft(recycledDraft)
+        target.saveDraft(draft)
+        source.saveJobs(listOf(job))
+        source.saveDraft(recycledDraft)
+        source.saveDraft(draft.copy(title = "Peer name", updatedAt = 2000))
+        source.saveDraftStep(draft.id, 2)
+        val archive = SyncArchive.create(sc, source, SyncSelection(
+            jobs = mapOf(job.id to SyncCategory.jobDefaults),
+            drafts = listOf(recycledDraft, draft).associate { it.id to SyncCategory.draftDefaults }
+        ))
+        var attempts = 0
+        try {
+            SyncArchive.merge(tc, target, archive) {
+                if (attempts++ == 0) {
+                    assertTrue(target.recycle(job.id, draft = false))
+                    assertTrue(target.recycle(recycledDraft.id, draft = true))
+                    target.saveDraftStep(draft.id, 5)
+                }
+            }
+            assertEquals(2, attempts)
+            assertTrue(target.jobs().isEmpty())
+            assertEquals(setOf(job.id, recycledDraft.id), target.recycled().map { it.job.id }.toSet())
+            assertEquals("Peer name", target.drafts().single().title)
+            assertEquals(5, target.draftStep(draft.id))
+        } finally { archive.delete() }
+    }
+
+    @Test fun invalidIncomingRevisionsLeaveTheStoreIntact() = phones { sc, source, tc, target ->
+        val row = InventoryItem(id = "material", name = "Paint", price = "20")
+        val incoming = Job(id = "incoming", updatedAt = 1000, inventory = listOf(row))
+        val local = Job(id = "local", title = "Keep")
+        target.saveJobs(listOf(local))
+        source.saveJobs(listOf(incoming))
+        val archive = SyncArchive.create(sc, source, SyncSelection(jobs = mapOf(incoming.id to SyncCategory.entries.toSet())))
+        val manifest = ZipFile(archive).use { zip ->
+            zip.getInputStream(zip.getEntry("manifest.json")).bufferedReader().use { it.readText() }
+        }
+        try {
+            val revisionFields = listOf(
+                "job" to "createdAt",
+                "job" to "updatedAt",
+                "fieldUpdated" to SyncCategory.NAME.name,
+                "fieldUpdated" to SyncCategory.COSTS.name,
+                "priceUpdated" to row.id
+            )
+            for ((section, field) in revisionFields) {
+                val payload = JSONObject(manifest)
+                payload.getJSONArray("jobs").getJSONObject(0).getJSONObject(section).put(field, Long.MAX_VALUE - 1)
+                ZipOutputStream(archive.outputStream()).use { zip ->
+                    zip.putNextEntry(ZipEntry("manifest.json"))
+                    zip.write(payload.toString().toByteArray())
+                }
+                assertThrows(IllegalArgumentException::class.java) { SyncArchive.merge(tc, target, archive) }
+                assertEquals(listOf(local), target.jobs())
+            }
+        } finally { archive.delete() }
+    }
+
+    @Test fun savedOutOfRangeRevisionsDoNotPreventEditsOrExport() = phones { sc, source, tc, target ->
+        val normal = Job(id = "normal", title = "Original", updatedAt = 1000)
+        val invalid = Job(id = "invalid", title = "Old peer", updatedAt = Long.MAX_VALUE,
+            inventory = listOf(InventoryItem(id = "material", name = "Paint", price = "20")))
+        val prefs = sc.getSharedPreferences("job_tracker", 0)
+        prefs.edit()
+            .putString("jobs", JSONArray().put(normal.toJson()).put(invalid.toJson()).toString())
+            .putString("field_updated_invalid", JSONObject().put(SyncCategory.NAME.name, Long.MAX_VALUE).toString())
+            .putString("price_updated_invalid", JSONObject().put("material", Long.MAX_VALUE).toString())
+            .commit()
+        source.applyJobChanges(listOf(normal), listOf(normal.copy(title = "Updated", updatedAt = 2000)))
+        transfer(sc, source, tc, target)
+        assertEquals(listOf("Updated", "Old peer"), target.jobs().map { it.title })
+        assertEquals("20", target.jobs().last().inventory.single().price)
     }
 
     @Test fun staleDraftEditorPreservesReceivedDetailsAndAdvancesRevision() = phones { _, _, _, target ->

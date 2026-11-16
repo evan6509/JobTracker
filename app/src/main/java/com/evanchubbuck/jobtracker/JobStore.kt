@@ -114,7 +114,7 @@ class JobStore(context: Context) {
 
     fun jobs(): List<Job> = transaction {
         val byId = linkedMapOf<String, Job>()
-        readArray("jobs").mapNotNull { runCatching { it.toJob() }.getOrNull() }.forEach { job ->
+        readArray("jobs").mapNotNull { runCatching { it.toJob().withValidSyncRevisions() }.getOrNull() }.forEach { job ->
             val previous = byId[job.id]
             if (previous == null || job.updatedAt > previous.updatedAt) byId[job.id] = job
         }
@@ -148,12 +148,20 @@ class JobStore(context: Context) {
         val liveDrafts = drafts()
         if ((liveJobs + liveDrafts).any { it.id == entry.job.id }) return RecycleRestoreResult.ALREADY_EXISTS
         if (entry.draft && liveDrafts.size >= 3) return RecycleRestoreResult.DRAFT_LIMIT
-        val restored = if (entry.draft) entry.job else entry.job.copy(
-            state = if (entry.job.state == Job.ACTIVE) Job.PLANNED else entry.job.state,
+        val job = entry.job.withValidSyncRevisions()
+        val stamps = SyncCategory.entries.associateWith { category ->
+            storedSyncRevision(entry.fieldStamps[category] ?: job.updatedAt, job.updatedAt)
+        }.toMutableMap()
+        val costStamp = stamps.getValue(SyncCategory.COSTS)
+        val prices = job.inventory.associate { item ->
+            val previous = entry.priceStamps[item.id] ?: if (entry.priceStamps.isEmpty()) costStamp else 0L
+            item.id to storedSyncRevision(previous, costStamp)
+        }
+        val restored = if (entry.draft) job else job.copy(
+            state = if (job.state == Job.ACTIVE) Job.PLANNED else job.state,
             priority = (liveJobs.maxOfOrNull { it.priority } ?: -1) + 1,
-            updatedAt = maxOf(System.currentTimeMillis(), nextRevision(
-                entry.fieldStamps.values + entry.priceStamps.values + entry.job.updatedAt)))
-        val stamps = SyncCategory.entries.associateWith { entry.fieldStamps[it] ?: entry.job.updatedAt }.toMutableMap()
+            updatedAt = maxOf(System.currentTimeMillis(), nextSyncRevision(
+                (stamps.values + prices.values + job.updatedAt).max())))
         SyncCategory.entries.forEach { category ->
             if (entry.job.syncValue(category) != restored.syncValue(category)) stamps[category] = restored.updatedAt
         }
@@ -161,9 +169,7 @@ class JobStore(context: Context) {
             .putString("field_updated_${restored.id}", JSONObject().apply {
                 stamps.forEach { (category, time) -> put(category.name, time) }
             }.toString())
-            .putString("price_updated_${restored.id}", priceStampsJson(entry.priceStamps.ifEmpty {
-                restored.inventory.associate { it.id to (stamps[SyncCategory.COSTS] ?: entry.job.updatedAt) }
-            }))
+            .putString("price_updated_${restored.id}", priceStampsJson(prices))
         if (entry.draft) {
             writeDrafts(editor, liveDrafts + restored)
             editor.putInt("draft_step_${restored.id}", entry.step)
@@ -191,9 +197,10 @@ class JobStore(context: Context) {
     private fun recycleJson(entries: List<RecycledJob>) = JSONArray().apply { entries.forEach { put(it.toJson()) } }.toString()
     fun drafts(): List<Job> = transaction {
         if (prefs.contains("drafts")) {
-            readArray("drafts").mapNotNull { runCatching { it.toJob() }.getOrNull() }.take(3)
+            readArray("drafts").mapNotNull { runCatching { it.toJob().withValidSyncRevisions() }.getOrNull() }.take(3)
         } else {
-            runCatching { prefs.getString("draft", null)?.let { JSONObject(it).toJob() } }.getOrNull()?.let(::listOf) ?: emptyList()
+            runCatching { prefs.getString("draft", null)?.let { JSONObject(it).toJob().withValidSyncRevisions() } }
+                .getOrNull()?.let(::listOf) ?: emptyList()
         }
     }
 
@@ -277,8 +284,9 @@ class JobStore(context: Context) {
 
     internal fun fieldStamps(job: Job): Map<SyncCategory, Long> = transaction {
         val saved = runCatching { prefs.getString("field_updated_${job.id}", null)?.let(::JSONObject) }.getOrNull()
+        val jobRevision = storedSyncRevision(job.updatedAt)
         return SyncCategory.entries.associateWith { category ->
-            saved?.optLong(category.name, job.updatedAt) ?: job.updatedAt
+            storedSyncRevision(saved?.optLong(category.name, jobRevision) ?: jobRevision, jobRevision)
         }
     }
 
@@ -290,7 +298,7 @@ class JobStore(context: Context) {
         val saved = runCatching { prefs.getString("price_updated_${job.id}", null)?.let(::JSONObject) }.getOrNull()
         val legacyStamp = fieldStamps(job).getValue(SyncCategory.COSTS)
         return job.inventory.associate { item ->
-            item.id to if (saved == null) legacyStamp else saved.optLong(item.id, 0L)
+            item.id to if (saved == null) legacyStamp else storedSyncRevision(saved.optLong(item.id, 0L), legacyStamp)
         }
     }
 
@@ -339,14 +347,10 @@ class JobStore(context: Context) {
     }.toString()
 
     private fun localRevision(old: Job?, updated: Job): Long {
-        if (old == null) return updated.updatedAt
-        return maxOf(updated.updatedAt, nextRevision(fieldStamps(old).values + materialPriceStamps(old).values + old.updatedAt))
-    }
-
-    private fun nextRevision(observed: Collection<Long>): Long {
-        val maximum = observed.max()
-        check(maximum < Long.MAX_VALUE) { "This job has an invalid revision." }
-        return maximum + 1
+        val requested = storedSyncRevision(updated.updatedAt)
+        if (old == null) return requested
+        val previous = (fieldStamps(old).values + materialPriceStamps(old).values + old.updatedAt).max()
+        return maxOf(requested, nextSyncRevision(previous))
     }
 
     internal fun applyDraftChange(before: Job, edited: Job): Job? = transaction {
@@ -400,7 +404,8 @@ class JobStore(context: Context) {
 
     private fun recordChangedFields(old: Job?, updated: Job): Job {
         val changed = old != null && SyncCategory.entries.any { old.syncValue(it) != updated.syncValue(it) }
-        val saved = if (changed) updated.copy(updatedAt = localRevision(old, updated)) else updated
+        val valid = updated.withValidSyncRevisions()
+        val saved = if (changed) valid.copy(updatedAt = localRevision(old, valid)) else valid
         val stamps = changedFieldStamps(old, saved)
         val prices = changedPriceStamps(old, saved)
         val editor = prefs.edit().putString("price_updated_${saved.id}", priceStampsJson(prices))
@@ -426,6 +431,10 @@ internal sealed interface DraftFinishResult {
     data class Invalid(val draft: Job, val message: String) : DraftFinishResult
     data object Missing : DraftFinishResult
 }
+
+private fun Job.withValidSyncRevisions(): Job =
+    if (createdAt in syncRevisionRange && updatedAt in syncRevisionRange) this
+    else copy(createdAt = storedSyncRevision(createdAt), updatedAt = storedSyncRevision(updatedAt))
 
 private fun Person.toJson() = JSONObject().put("name", name).put("phone", phone).put("work", work)
 private fun JSONObject.toPerson() = Person(optString("name"), optString("phone"), optString("work"))

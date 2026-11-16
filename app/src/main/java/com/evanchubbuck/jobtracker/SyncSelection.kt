@@ -1,5 +1,14 @@
 package com.evanchubbuck.jobtracker
 
+// Revisions are epoch milliseconds. Bound them to the end of year 9999.
+internal val syncRevisionRange = 0L..253_402_300_799_999L
+
+internal fun storedSyncRevision(value: Long, fallback: Long = 0L): Long =
+    if (value in syncRevisionRange) value else fallback
+
+internal fun nextSyncRevision(value: Long): Long =
+    value.coerceIn(0L, syncRevisionRange.last - 1) + 1
+
 internal enum class SyncCategory(val label: String, val fields: List<String>) {
     NAME("Job name", listOf("title")),
     STATUS("Status", listOf("state", "priority")),

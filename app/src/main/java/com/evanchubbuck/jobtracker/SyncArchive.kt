@@ -107,15 +107,21 @@ internal object SyncArchive {
     }
 
     fun merge(context: Context, store: JobStore, archive: File, beforeCommit: () -> Unit = {}): SyncResult {
-        repeat(3) {
-            mergeAttempt(context, store, archive, beforeCommit)?.let { return it }
+        val initial = store.syncSnapshot()
+        repeat(3) { attempt ->
+            val snapshot = if (attempt == 0) initial else store.syncSnapshot()
+            mergeAttempt(context, store, archive, initial, snapshot, beforeCommit)?.let { return it }
         }
         error("Jobs changed during sync. Please try again.")
     }
 
-    private fun mergeAttempt(context: Context, store: JobStore, archive: File, beforeCommit: () -> Unit): SyncResult? {
+    private fun mergeAttempt(
+        context: Context, store: JobStore, archive: File, initial: SyncStoreSnapshot,
+        snapshot: SyncStoreSnapshot, beforeCommit: () -> Unit
+    ): SyncResult? {
         require(archive.length() in 1..MAX_ARCHIVE) { "Invalid sync transfer size." }
         val created = mutableListOf<File>()
+        val removedIds = initial.fields.keys - snapshot.fields.keys
         try {
             ZipFile(archive).use { zip ->
                 val entry = zip.getEntry("manifest.json") ?: error("Sync data is missing.")
@@ -136,7 +142,6 @@ internal object SyncArchive {
                 }
                 val records = manifest.getJSONArray("jobs")
                 require(records.length() <= 10000) { "Too many jobs in sync data." }
-                val snapshot = store.syncSnapshot()
                 val local = snapshot.jobs
                 val localDrafts = snapshot.drafts
                 val merged = local.toMutableList()
@@ -151,11 +156,12 @@ internal object SyncArchive {
                     val record = records.getJSONObject(index)
                     val id = record.getJSONObject("job").optString("id")
                     require(id.isNotBlank() && seenJobs.add(id)) { "A transferred job is invalid." }
+                    if (id in removedIds) continue
                     val position = merged.indexOfFirst { it.id == id }
                     val newPriority = (merged.maxOfOrNull { it.priority } ?: -1) + 1
                     val old = merged.getOrNull(position) ?: localDrafts.firstOrNull { it.id == id }
                         ?.copy(state = Job.PLANNED, priority = newPriority)
-                    val choice = mergeSelectedRecord(context, snapshot, zip, photoComparison, record, old,
+                    val choice = mergeSelectedRecord(context, snapshot, initial, zip, photoComparison, record, old,
                         newPriority, created)
                     photoCount += choice.photos
                     fieldStamps[id] = choice.stamps
@@ -175,23 +181,31 @@ internal object SyncArchive {
                     val id = record.getJSONObject("job").optString("id")
                     require(id.isNotBlank() && seenDrafts.add(id)) { "A transferred draft is invalid." }
                     // A completed setup remains a saved job even if the peer still has its old draft.
-                    if (id in savedIds) continue
+                    if (id in savedIds || id in removedIds) continue
                     val position = combinedDrafts.indexOfFirst { it.id == id }
                     val localDraft = combinedDrafts.getOrNull(position)
                     if (localDraft == null && combinedDrafts.size >= 3) {
                         draftSkipped = true
                         continue
                     }
-                    val choice = mergeSelectedRecord(context, snapshot, zip, photoComparison, record, localDraft, 0, created)
+                    val choice = mergeSelectedRecord(context, snapshot, initial, zip, photoComparison, record, localDraft, 0, created)
                     photoCount += choice.photos
                     fieldStamps[id] = choice.stamps
                     priceStamps[id] = choice.priceStamps
                     if (choice.changed) {
                         if (position >= 0) combinedDrafts[position] = choice.job else combinedDrafts.add(choice.job)
-                        draftSteps[id] = record.optInt("step", 0).coerceIn(0, 7)
+                        if (localDraft == null || snapshot.steps[id] == initial.steps[id]) {
+                            draftSteps[id] = record.optInt("step", 0).coerceIn(0, 7)
+                        }
                     }
                 }
-                val active = merged.filter { it.state == Job.ACTIVE }.maxWithOrNull(compareBy<Job> { it.updatedAt }.thenBy { it.id })?.id
+                val locallyActivated = local.firstOrNull { job ->
+                    job.state == Job.ACTIVE && snapshot.fields[job.id]?.get(SyncCategory.STATUS) !=
+                        initial.fields[job.id]?.get(SyncCategory.STATUS)
+                }?.id
+                val active = merged.filter { it.state == Job.ACTIVE }.maxWithOrNull(
+                    compareBy<Job> { it.id == locallyActivated }.thenBy { it.updatedAt }.thenBy { it.id }
+                )?.id
                 val finalJobs = merged.map { if (it.state == Job.ACTIVE && it.id != active) it.copy(state = Job.PLANNED) else it }
                 // A concurrent local write invalidates the snapshot; retry without holding up the UI.
                 if (!store.commitSync(snapshot, finalJobs, combinedDrafts, fieldStamps, priceStamps, draftSteps, beforeCommit)) {
@@ -236,8 +250,8 @@ internal object SyncArchive {
     )
 
     private fun mergeSelectedRecord(
-        context: Context, snapshot: SyncStoreSnapshot, zip: ZipFile, photoComparison: PhotoComparison, record: JSONObject, old: Job?,
-        newPriority: Int, created: MutableList<File>
+        context: Context, snapshot: SyncStoreSnapshot, firstSnapshot: SyncStoreSnapshot, zip: ZipFile,
+        photoComparison: PhotoComparison, record: JSONObject, old: Job?, newPriority: Int, created: MutableList<File>
     ): SelectedMerge {
         val array = record.getJSONArray("fields")
         val categories = (0 until array.length()).map { index ->
@@ -249,6 +263,8 @@ internal object SyncArchive {
         }
         val jobJson = record.getJSONObject("job")
         require(jobJson.optString("id").isNotBlank()) { "A transferred job is invalid." }
+        jobJson.checkedRevision("createdAt")
+        jobJson.checkedRevision("updatedAt")
         categories.forEach { category -> category.fields.forEach { key ->
             require(jobJson.has(key)) { "A selected job detail is missing." }
         } }
@@ -267,13 +283,23 @@ internal object SyncArchive {
         val stamps = (old?.let { snapshot.fields.getValue(it.id) }
             ?: SyncCategory.entries.associateWith { 0L }).toMutableMap()
         val priceStamps = old?.let { snapshot.prices.getValue(it.id) }.orEmpty().toMutableMap()
+        val originalFields = firstSnapshot.fields[remote.id].orEmpty()
+        val originalPrices = firstSnapshot.prices[remote.id].orEmpty()
+        val editedPrices = priceStamps.keys.filter { priceStamps[it] != originalPrices[it] }.toSet()
+        val dropsEditedPrice = SyncCategory.INVENTORY in categories && editedPrices.isNotEmpty() &&
+            !remote.inventory.map { it.id }.containsAll(editedPrices)
         var changed = old == null
         var photoCount = 0
         // Materials must merge before prices; never trust the order of incoming fields.
         categories.filterNot { it == SyncCategory.COSTS }.forEach { category ->
-            val incomingStamp = remoteStamps.getLong(category.name)
-            require(incomingStamp >= 0) { "Invalid job detail date." }
+            val incomingStamp = remoteStamps.checkedRevision(category.name)
             val localStamp = stamps[category] ?: 0L
+            if (old != null && incomingStamp >= localStamp &&
+                (localStamp != originalFields[category] || category == SyncCategory.INVENTORY && dropsEditedPrice)) {
+                stamps[category] = nextSyncRevision(incomingStamp)
+                changed = true
+                return@forEach
+            }
             val take = old == null || when {
                 incomingStamp != localStamp -> incomingStamp > localStamp
                 category == SyncCategory.PHOTOS -> {
@@ -302,30 +328,41 @@ internal object SyncArchive {
             }
         }
         if (SyncCategory.COSTS in categories) {
-            val incomingStamp = remoteStamps.getLong(SyncCategory.COSTS.name)
-            require(incomingStamp >= 0) { "Invalid price date." }
+            val incomingStamp = remoteStamps.checkedRevision(SyncCategory.COSTS.name)
             val remotePrices = remote.inventory.associate { it.id to prices.getString(it.id) }.toSortedMap()
             val remotePriceStamps = record.optJSONObject("priceUpdated")
             require(remotePriceStamps == null || remotePriceStamps.keys().asSequence().toSet() == remotePrices.keys) {
                 "Price dates do not match the transferred materials."
             }
+            // A transfer may omit individual dates and fall back to the category revision.
+            val remoteTimes = remotePrices.mapValues { (id, _) -> remotePriceStamps?.checkedRevision(id) ?: incomingStamp }
             merged = merged.copy(inventory = merged.inventory.map { item ->
                 val remotePrice = remotePrices[item.id] ?: return@map item
                 require(validMaterialPrice(remotePrice)) { "Invalid material price in sync data." }
-                // Older v3 peers have only the category timestamp; new peers preserve each item's edit time.
-                val remoteTime = remotePriceStamps?.getLong(item.id) ?: incomingStamp
-                require(remoteTime >= 0) { "Invalid material price date." }
-                if (remoteWins(priceStamps[item.id] ?: 0L, remoteTime, item.price, remotePrice)) {
+                val remoteTime = remoteTimes.getValue(item.id)
+                val localTime = priceStamps[item.id] ?: 0L
+                if (item.id in editedPrices && remoteTime >= localTime) {
+                    priceStamps[item.id] = nextSyncRevision(remoteTime)
+                    changed = true
+                    item
+                } else if (remoteWins(localTime, remoteTime, item.price, remotePrice)) {
                     priceStamps[item.id] = remoteTime
                     changed = true
                     item.copy(price = remotePrice)
                 } else item
             })
-            stamps[SyncCategory.COSTS] = maxOf(stamps[SyncCategory.COSTS] ?: 0L, incomingStamp)
+            stamps[SyncCategory.COSTS] = maxOf(stamps[SyncCategory.COSTS] ?: 0L,
+                incomingStamp, priceStamps.values.maxOrNull() ?: 0L)
         }
         val finalPriceStamps = merged.inventory.associate { it.id to (priceStamps[it.id] ?: 0L) }
-        if (changed) merged = merged.copy(updatedAt = maxOf(initial.updatedAt, remote.updatedAt))
+        if (changed) merged = merged.copy(updatedAt = maxOf(initial.updatedAt, remote.updatedAt, stamps.values.max()))
         return SelectedMerge(merged, stamps, finalPriceStamps, categories, changed, photoCount)
+    }
+
+    private fun JSONObject.checkedRevision(key: String): Long {
+        val value = get(key)
+        require(value is Int || value is Long) { "Invalid date in sync data." }
+        return (value as Number).toLong().also { require(it in syncRevisionRange) { "Invalid date in sync data." } }
     }
 
     private fun applyCategory(base: Job, remote: Job, category: SyncCategory): Job = when (category) {
