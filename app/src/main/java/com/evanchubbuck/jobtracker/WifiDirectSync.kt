@@ -15,16 +15,18 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
+import java.io.Closeable
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.io.IOException
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
@@ -62,10 +64,7 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
     private var manager: WifiP2pManager? = null
     private var channel: WifiP2pManager.Channel? = null
     private var receiver: BroadcastReceiver? = null
-    private var transfer: Job? = null
-    @Volatile private var socket: Socket? = null
-    @Volatile private var server: ServerSocket? = null
-    private var approval: CompletableDeferred<Boolean>? = null
+    private var transfer: WifiDirectTransfer? = null
 
     fun start() {
         if (scope != null) return
@@ -77,9 +76,12 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         }
         val wifi = activity.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
         if (wifi == null) { status = "Wi-Fi Direct is unavailable on this phone."; return }
-        scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        val running = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        scope = running
         manager = wifi
-        channel = wifi.initialize(activity, activity.mainLooper) { status = "Wi-Fi Direct stopped. Reopen this screen to try again." }
+        channel = wifi.initialize(activity, activity.mainLooper) {
+            if (scope === running) status = "Wi-Fi Direct stopped. Reopen this screen to try again."
+        }
         val filter = IntentFilter().apply {
             addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
             addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
@@ -87,6 +89,7 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         }
         receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
+                if (this@WifiDirectSync.receiver !== this) return
                 when (intent.action) {
                     WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> if (intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1) != WifiP2pManager.WIFI_P2P_STATE_ENABLED) {
                         status = "Turn on Wi-Fi to use Wi-Fi Direct."
@@ -102,15 +105,11 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
     }
 
     fun stop() {
-        approval?.complete(false)
-        approval = null
-        runCatching { socket?.close() }
-        runCatching { server?.close() }
-        socket = null
-        server = null
+        val active = transfer
+        transfer = null
         scope?.cancel()
         scope = null
-        transfer = null
+        active?.close()
         receiver?.let { runCatching { activity.unregisterReceiver(it) } }
         receiver = null
         val wifi = manager
@@ -130,8 +129,10 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         status = "Searching for nearby phones…"
         try {
             wifi.discoverPeers(wifiChannel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { refreshPeers() }
-                override fun onFailure(reason: Int) { status = "Could not search (code $reason). Check Wi-Fi and Location, then try again." }
+                override fun onSuccess() { if (channel === wifiChannel) refreshPeers() }
+                override fun onFailure(reason: Int) {
+                    if (channel === wifiChannel) status = "Could not search (code $reason). Check Wi-Fi and Location, then try again."
+                }
             })
         } catch (_: SecurityException) { status = "Nearby devices permission is needed to search." }
     }
@@ -139,7 +140,11 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
     private fun refreshPeers() {
         val wifi = manager ?: return
         val wifiChannel = channel ?: return
-        try { wifi.requestPeers(wifiChannel) { list -> peers = list.deviceList.toList().sortedBy { it.deviceName } } }
+        try {
+            wifi.requestPeers(wifiChannel) { list ->
+                if (channel === wifiChannel) peers = list.deviceList.toList().sortedBy { it.deviceName }
+            }
+        }
         catch (_: SecurityException) { status = "Nearby devices permission is needed to list phones." }
     }
 
@@ -150,8 +155,12 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         val config = WifiP2pConfig().apply { deviceAddress = peer.deviceAddress; wps.setup = WpsInfo.PBC }
         try {
             wifi.connect(wifiChannel, config, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { status = "Waiting for Wi-Fi Direct connection…" }
-                override fun onFailure(reason: Int) { status = "Could not connect (code $reason). Search again on both phones." }
+                override fun onSuccess() {
+                    if (channel === wifiChannel && transfer == null) status = "Waiting for Wi-Fi Direct connection…"
+                }
+                override fun onFailure(reason: Int) {
+                    if (channel === wifiChannel && transfer == null) status = "Could not connect (code $reason). Search again on both phones."
+                }
             })
         } catch (_: SecurityException) { status = "Nearby devices permission is needed to connect." }
     }
@@ -161,7 +170,7 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         val wifiChannel = channel ?: return
         try {
             wifi.requestConnectionInfo(wifiChannel) { info ->
-                if (info.groupFormed && transfer == null) beginTransfer(info)
+                if (channel === wifiChannel && info.groupFormed && transfer == null && result == null) beginTransfer(info)
             }
         } catch (_: SecurityException) { status = "Nearby devices permission is needed to sync." }
     }
@@ -169,61 +178,74 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
     private fun beginTransfer(info: WifiP2pInfo) {
         val running = scope ?: return
         val outgoingSelection = selection
+        val active = WifiDirectTransfer()
+        transfer = active
         busy = true
-        transfer = running.launch {
+        running.launch {
             status = "Connected. Opening a secure transfer…"
             try {
                 withContext(Dispatchers.IO) {
                     val connected = if (info.isGroupOwner) {
-                        ServerSocket(PORT).also { server = it; it.soTimeout = 30_000 }.accept()
-                    } else connectToOwner(info)
-                    socket = connected
-                    connected.soTimeout = 180_000
-                    connected.use { exchange(it, info.isGroupOwner, outgoingSelection) }
+                        active.ownSocket(ServerSocket()).use { listener ->
+                            listener.reuseAddress = true
+                            listener.bind(InetSocketAddress(PORT))
+                            listener.soTimeout = 30_000
+                            active.ownSocket(listener.accept())
+                        }
+                    } else connectToOwner(info, active)
+                    connected.use {
+                        it.soTimeout = 180_000
+                        exchange(it, info.isGroupOwner, outgoingSelection, active)
+                    }
                 }
             } catch (_: TimeoutCancellationException) {
-                status = "The code confirmation timed out. Search again on both phones."
+                if (transfer === active) status = "The code confirmation timed out. Search again on both phones."
             } catch (_: CancellationException) {
                 // The user left the sync screen.
             } catch (error: Exception) {
-                status = "Sync failed: ${error.message ?: "connection lost"}. Try again on both phones."
+                if (transfer === active) status = "Sync failed: ${error.message ?: "connection lost"}. Try again on both phones."
             } finally {
-                code = null
-                socket = null
-                runCatching { server?.close() }
-                server = null
-                transfer = null
-                busy = false
+                active.close()
+                if (transfer === active) {
+                    code = null
+                    transfer = null
+                    busy = false
+                }
             }
         }
     }
 
-    private suspend fun connectToOwner(info: WifiP2pInfo): Socket {
+    private suspend fun connectToOwner(info: WifiP2pInfo, active: WifiDirectTransfer): Socket {
         val address = info.groupOwnerAddress ?: error("Could not find the other phone.")
         repeat(15) { attempt ->
-            try { return Socket().apply { connect(java.net.InetSocketAddress(address, PORT), 2_000) } }
-            catch (error: Exception) { if (attempt == 14) throw error; delay(1_000) }
+            val socket = active.ownSocket(Socket())
+            try {
+                socket.connect(InetSocketAddress(address, PORT), 2_000)
+                return socket
+            } catch (error: IOException) {
+                runCatching { socket.close() }
+                if (attempt == 14) throw error
+                delay(1_000)
+            }
         }
         error("Could not reach the other phone.")
     }
 
-    private suspend fun exchange(connection: Socket, owner: Boolean, outgoingSelection: SyncSelection) {
+    private suspend fun exchange(connection: Socket, owner: Boolean, outgoingSelection: SyncSelection, active: WifiDirectTransfer) {
         val input = DataInputStream(connection.getInputStream().buffered())
         val output = DataOutputStream(connection.getOutputStream().buffered())
         val handshake = exchangeSyncHello(input, output, owner)
         val verificationCode = syncVerificationCode(handshake)
-        val choice = CompletableDeferred<Boolean>()
         withContext(Dispatchers.Main) {
-            approval = choice
             code = verificationCode
             status = "Compare the code on both phones. Confirm on each phone to share the details each phone selected."
         }
-        val accepted = withTimeout(120_000) { choice.await() }
+        val accepted = withTimeout(120_000) { active.approval.await() }
         if (!accepted) error("Transfer canceled")
         handshake.verifyHandshake()
         val secure = SecureSyncChannel(handshake.toConnectionContext(), input, output)
         secure.confirm()
-        withContext(Dispatchers.Main) { code = null; approval = null; status = "Transferring selected details…" }
+        withContext(Dispatchers.Main) { code = null; status = "Transferring selected details…" }
         val outgoing = SyncArchive.create(activity, store, outgoingSelection)
         var incoming: File? = null
         try {
@@ -249,7 +271,35 @@ internal class WifiDirectSync(private val activity: Activity, private val store:
         }
     }
 
-    fun confirm(yes: Boolean) { approval?.complete(yes) }
+    fun confirm(yes: Boolean) {
+        if (code != null) transfer?.approval?.complete(yes)
+    }
 
     private companion object { const val PORT = 39173 }
+}
+
+/** The transfer may unwind after its screen closes. It only releases sockets it opened. */
+internal class WifiDirectTransfer : Closeable {
+    val approval = CompletableDeferred<Boolean>()
+    private val sockets = mutableListOf<Closeable>()
+    private var closed = false
+
+    @Synchronized
+    fun <T : Closeable> ownSocket(socket: T): T {
+        if (closed) {
+            runCatching { socket.close() }
+            throw CancellationException("Sync canceled")
+        }
+        sockets.add(socket)
+        return socket
+    }
+
+    @Synchronized
+    override fun close() {
+        if (closed) return
+        closed = true
+        approval.cancel()
+        sockets.asReversed().forEach { runCatching { it.close() } }
+        sockets.clear()
+    }
 }
