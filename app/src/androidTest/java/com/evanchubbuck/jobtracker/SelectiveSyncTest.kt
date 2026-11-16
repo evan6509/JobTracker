@@ -144,12 +144,13 @@ class SelectiveSyncTest {
         source.saveDraft(draft)
         transfer(sc, source, tc, target, SyncSelection(drafts = mapOf(draft.id to setOf(SyncCategory.NAME, SyncCategory.CLIENTS))))
         target.saveDraft(target.drafts().single().copy(description = "Local private work", updatedAt = 9000))
-        assertTrue(source.finishDraft(draft.copy(title = "Finished job", updatedAt = 5000)))
+        source.saveDraft(draft.copy(title = "Finished job", updatedAt = 5000))
+        assertTrue(source.finishDraft(draft.id) is DraftFinishResult.Saved)
         transfer(sc, source, tc, target, SyncSelection(jobs = mapOf(draft.id to setOf(SyncCategory.NAME, SyncCategory.CLIENTS))))
         assertTrue(target.drafts().isEmpty())
         assertEquals("Finished job", target.jobs().single().title)
         assertEquals("Local private work", target.jobs().single().description)
-        assertFalse(target.finishDraft(draft))
+        assertEquals(DraftFinishResult.Missing, target.finishDraft(draft.id))
         source.saveDraft(draft.copy(title = "Stale peer draft", updatedAt = 10000))
         transfer(sc, source, tc, target, SyncSelection(drafts = mapOf(draft.id to SyncCategory.draftDefaults)))
         assertTrue(target.drafts().isEmpty())
@@ -161,10 +162,10 @@ class SelectiveSyncTest {
         target.saveDraft(draft)
         val saved = draft.copy(title = "Newer saved job", description = "Keep work", updatedAt = 9000)
         target.saveJobs(listOf(saved))
-        assertTrue(target.finishDraft(draft.copy(title = "Stale overwrite", updatedAt = 5000)))
+        assertTrue(target.finishDraft(draft.id) is DraftFinishResult.Saved)
         assertEquals(listOf(saved), target.jobs())
         assertTrue(target.drafts().isEmpty())
-        assertFalse(target.finishDraft(draft))
+        assertEquals(DraftFinishResult.Missing, target.finishDraft(draft.id))
     }
 
     @Test fun olderDuplicateSavedIdsReadAsNewestJobWithoutChangingIdOrder() = phones { _, _, tc, target ->

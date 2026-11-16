@@ -21,7 +21,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -40,6 +42,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.repeatOnLifecycle
 import com.evanchubbuck.jobtracker.ui.theme.JobTrackerTheme
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -126,15 +129,42 @@ class MainActivity : ComponentActivity() {
         var scanRaw by rememberSaveable { mutableStateOf("") }
         var checkingUpdate by remember { mutableStateOf(false) }
         var latestRelease by remember { mutableStateOf<GitHubRelease?>(null) }
+        val releaseDownloads = remember { ReleaseDownloadStore(this) }
+        var releaseDownload by remember {
+            mutableStateOf(if (releaseUpdatesEnabled) releaseDownloads.load() else null)
+        }
+        val download = releaseDownload
+        var downloadReady by remember(download?.id) { mutableStateOf(false) }
+        var startupCheck by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+        val updateSnackbar = remember { SnackbarHostState() }
+        fun trackDownload(value: ReleaseDownload?) {
+            releaseDownloads.save(value)
+            releaseDownload = value
+        }
         val scanPreview = remember(scanRaw) { runCatching { if (scanRaw.isBlank()) null else JSONObject(scanRaw).getJSONObject("job").toJob() }.getOrNull() }
         val scanSource = remember(scanRaw) { runCatching { JSONObject(scanRaw).getString("source") }.getOrDefault("") }
         val scope = rememberCoroutineScope()
+        fun discardDownload(id: Long) {
+            if (releaseDownload?.id != id) return
+            updateSnackbar.currentSnackbarData?.dismiss()
+            trackDownload(null)
+        }
+        LaunchedEffect(releaseUpdatesEnabled, download?.id) {
+            if (releaseUpdatesEnabled) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                releaseDownloads.removePendingDownloads()
+            }
+        }
         DisposableEffect(releaseUpdatesEnabled) {
-            var startupCheck: kotlinx.coroutines.Job? = null
             fun checkOnOpen() {
-                if (releaseUpdatesEnabled && startupCheck?.isActive != true) {
+                val pending = releaseDownload?.takeIf { isNewerRelease(it.tag, installedVersion) }
+                if (releaseUpdatesEnabled && pending?.deferred != false &&
+                    !checkingUpdate && latestRelease == null && startupCheck?.isActive != true
+                ) {
                     startupCheck = scope.launch {
-                        startupUpdate(installedVersion)?.let { latestRelease = it }
+                        val release = startupUpdate(installedVersion)
+                        if (release != null && release.tag != releaseDownload?.tag) {
+                            latestRelease = release
+                        }
                     }
                 }
             }
@@ -153,20 +183,70 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        LaunchedEffect(download?.id) {
+            if (download == null) return@LaunchedEffect
+            if (!isNewerRelease(download.tag, installedVersion)) {
+                discardDownload(download.id)
+                return@LaunchedEffect
+            }
+            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                val ready = try {
+                    awaitReleaseDownload(this@MainActivity, download.id)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    false
+                }
+                if (releaseDownload?.id != download.id) return@repeatOnLifecycle
+                downloadReady = ready
+                if (ready) {
+                    updateSnackbar.currentSnackbarData?.dismiss()
+                } else {
+                    val deferred = releaseDownload?.deferred == true
+                    discardDownload(download.id)
+                    if (!deferred) {
+                        message = "Couldn't finish downloading ${download.tag}. Check for updates to try again."
+                    }
+                }
+            }
+        }
+
+        LaunchedEffect(download?.id, downloadReady) {
+            if (download != null && !downloadReady && !download.deferred &&
+                isNewerRelease(download.tag, installedVersion)
+            ) {
+                updateSnackbar.showSnackbar("Downloading ${download.tag}…")
+            }
+        }
+
         DisposableEffect(screen, nearbyAllowed, networkAllowed) {
             if (screen == "sync" && nearbyAllowed && networkAllowed) sync.start()
             onDispose { if (screen == "sync") sync.stop() }
         }
-        LaunchedEffect(sync.result) {
-            if (sync.result != null) {
-                jobs = store.jobs()
-                drafts = store.drafts()
+        // Storage changes remain observable even when the sync screen's scope is canceled.
+        DisposableEffect(store) {
+            val prefs = getSharedPreferences("job_tracker", MODE_PRIVATE)
+            val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key in setOf("jobs", "drafts", "recycle_bin")) scope.launch {
+                    jobs = store.jobs()
+                    drafts = store.drafts()
+                    recycled = store.recycled()
+                }
             }
+            prefs.registerOnSharedPreferenceChangeListener(listener)
+            jobs = store.jobs()
+            drafts = store.drafts()
+            recycled = store.recycled()
+            onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
         }
 
-        fun persist(list: List<Job>) { jobs = list; store.saveJobs(list) }
-        fun deleteUnusedPhotos(paths: List<String>, usedPhotos: Set<String>) {
-            val retainedPhotos = usedPhotos + store.recycled().flatMap { it.job.photos }
+        fun persist(list: List<Job>) {
+            store.applyJobChanges(jobs, list)
+            jobs = store.jobs()
+        }
+        fun deleteUnusedPhotos(paths: List<String>) = store.transaction {
+            val jobsWithPhotos = store.jobs() + store.drafts() + store.recycled().map { it.job }
+            val retainedPhotos = jobsWithPhotos.flatMap { it.photos }.toSet()
             deleteUnreferencedJobPhotos(this@MainActivity, paths, retainedPhotos)
         }
         fun discardDraft(id: String) {
@@ -196,27 +276,42 @@ class MainActivity : ComponentActivity() {
         fun deleteRecycledForever(ids: Set<String>) {
             val removed = store.deleteRecycled(ids)
             recycled = store.recycled()
-            val usedPhotos = jobs.flatMap { it.photos }.toSet() + drafts.flatMap { it.photos }
-            deleteUnusedPhotos(removed.flatMap { it.job.photos }, usedPhotos)
+            deleteUnusedPhotos(removed.flatMap { it.job.photos })
         }
-        fun changeEditor(value: Job) {
-            editor = value
-            if (editingId.isBlank()) {
-                val changed = value.copy(updatedAt = System.currentTimeMillis())
-                drafts = drafts.map { if (it.id == activeDraftId) changed else it }
-                editor = changed
-                store.saveDraft(changed)
+        fun changeEditor(before: Job, value: Job): Job? {
+            val changed = value.copy(updatedAt = System.currentTimeMillis())
+            val draft = editingId.isBlank()
+            val applied = store.applyEditorChange(before, changed, draft)
+            editor = applied?.job
+            if (draft) drafts = store.drafts() else jobs = store.jobs()
+            if (applied == null) {
+                message = "This job or draft is no longer available."
+            } else if (applied.conflicts.isNotEmpty()) {
+                val sections = applied.conflicts.joinToString(", ") { it.label }
+                message = "$sections changed during sync. Review the latest details and try your edit again."
             }
-            else persist(jobs.map { if (it.id == editingId) value.copy(updatedAt = System.currentTimeMillis()) else it })
+            return editor
+        }
+        fun editorError(job: Job, problem: String) {
+            error = problem
+            step = when {
+                job.clients.none { it.name.isNotBlank() } || job.clients.any { !validPhone(it.phone) || (it.name.isBlank() && it.phone.isNotBlank()) } -> 0
+                job.workers.any { !validPhone(it.phone) || (it.name.isBlank() && (it.phone.isNotBlank() || it.work.isNotBlank())) || (it.name.isNotBlank() && it.work.isBlank()) } -> 5
+                job.inventory.any { !validMaterialPrice(it.price) || (it.name.isBlank() && (it.quantity.isNotBlank() || it.notes.isNotBlank() || it.price.isNotBlank())) } -> 4
+                else -> 2
+            }
+            if (editingId.isBlank()) store.saveDraftStep(job.id, step)
         }
         fun openEditor(id: String = "", section: Int = 0) {
             editingId = id
             if (id.isBlank()) {
-                if (drafts.size >= 3) { screen = "drafts"; return }
-                val newDraft = Job()
+                val newDraft = store.createDraft()
+                drafts = store.drafts()
+                if (newDraft == null) {
+                    screen = "drafts"
+                    return
+                }
                 activeDraftId = newDraft.id
-                store.saveDraft(newDraft)
-                drafts = drafts + newDraft
                 editor = newDraft
                 step = 0
             } else {
@@ -310,12 +405,17 @@ class MainActivity : ComponentActivity() {
             if (current != null && uris.isNotEmpty()) {
                 val editSession = editingId
                 scope.launch {
-                    val paths = withContext(Dispatchers.IO) { uris.mapNotNull { copyPhoto(this@MainActivity, it) } }
-                    val latest = editor ?: if (editingId.isBlank()) drafts.firstOrNull { it.id == activeDraftId }
-                        else jobs.firstOrNull { it.id == editingId }
-                    if (latest?.id == current.id && editingId == editSession && screen == "editor") changeEditor(latest.copy(photos = latest.photos + paths))
-                    else paths.forEach { File(it).delete() }
-                    if (paths.size != uris.size) message = "Some photos could not be added."
+                    val count = importJobPhotos(uris, { copyPhoto(this@MainActivity, it) }) { paths ->
+                        if (paths.isEmpty() || current.id != editingId.ifBlank { activeDraftId } ||
+                            editingId != editSession || screen != "editor") return@importJobPhotos false
+                        store.transaction {
+                            val records = if (editSession.isBlank()) store.drafts() else store.jobs()
+                            val latest = records.firstOrNull { it.id == current.id } ?: return@transaction false
+                            val updated = changeEditor(latest, latest.copy(photos = latest.photos + paths))
+                            updated?.photos?.containsAll(paths) == true
+                        }
+                    }
+                    if (count != uris.size) message = "Some photos could not be added."
                 }
             }
         }
@@ -323,8 +423,7 @@ class MainActivity : ComponentActivity() {
             if (result.resultCode == RESULT_OK) result.data?.getStringExtra(PhotoCaptureActivity.PHOTO_PATH)?.let { path ->
                 val updated = attachCapturedPhoto(this@MainActivity, store, cameraJobId, path)
                 if (updated == null) {
-                    val used = (store.jobs() + store.drafts()).flatMap { it.photos }.toSet()
-                    deleteUnusedPhotos(listOf(path), used)
+                    deleteUnusedPhotos(listOf(path))
                     message = "This job or draft is no longer available. The photo wasn't added."
                 } else {
                     jobs = store.jobs()
@@ -350,10 +449,28 @@ class MainActivity : ComponentActivity() {
         fun scan() { scanner.launch(ScanOptions().setCaptureActivity(JobScannerActivity::class.java).setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Scan a JobTracker job QR code").setBeepEnabled(false).setOrientationLocked(false)) }
         fun checkForUpdate() {
             if (!releaseUpdatesEnabled || checkingUpdate) return
+            if (releaseDownload != null && !downloadReady) {
+                if (updateSnackbar.currentSnackbarData == null) {
+                    scope.launch { updateSnackbar.showSnackbar("The update is downloading.") }
+                }
+                return
+            }
+            startupCheck?.cancel()
             checkingUpdate = true
             scope.launch {
                 try {
-                    latestRelease = fetchLatestRelease()
+                    val release = fetchLatestRelease()
+                    val saved = releaseDownload
+                    if (saved != null && downloadReady && release.tag == saved.tag) {
+                        if (downloadedReleaseUri(this@MainActivity, saved.id) != null && releaseDownload?.id == saved.id) {
+                            trackDownload(saved.copy(deferred = false))
+                        } else {
+                            discardDownload(saved.id)
+                            latestRelease = release
+                        }
+                    } else {
+                        latestRelease = release
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -365,7 +482,7 @@ class MainActivity : ComponentActivity() {
         }
 
         BackHandler(screen != "home") { back() }
-        Scaffold(containerColor = UiCanvas, topBar = {
+        Scaffold(containerColor = UiCanvas, snackbarHost = { SnackbarHost(updateSnackbar) }, topBar = {
             Surface(color = UiInk) {
                 Row(Modifier.fillMaxWidth().statusBarsPadding().height(52.dp).padding(horizontal = 12.dp),
                     verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
@@ -397,6 +514,19 @@ class MainActivity : ComponentActivity() {
                                     DropdownMenuItem(text = { Text("Check for updates") }, onClick = {
                                         menuExpanded = false; checkForUpdate()
                                     })
+                                    if (download != null) {
+                                        if (downloadReady && download.deferred) {
+                                            DropdownMenuItem(text = { Text("Install downloaded update") }, onClick = {
+                                                menuExpanded = false
+                                                trackDownload(download.copy(deferred = false))
+                                            })
+                                        } else if (!downloadReady && !download.deferred) {
+                                            DropdownMenuItem(text = { Text("Cancel update download") }, onClick = {
+                                                menuExpanded = false
+                                                discardDownload(download.id)
+                                            })
+                                        }
+                                    }
                                 }
                                 HorizontalDivider()
                                 DropdownMenuItem(text = { Text("Clear all data", color = MaterialTheme.colorScheme.error) }, onClick = {
@@ -491,43 +621,41 @@ class MainActivity : ComponentActivity() {
                 "editor" -> {
                     val current = editor ?: if (editingId.isBlank()) drafts.firstOrNull { it.id == activeDraftId } else jobs.firstOrNull { it.id == editingId }
                     if (current != null) EditorScreen(current, step, editingId.isNotBlank(), error, area,
-                        onChange = { changeEditor(it); error = "" }, onStep = { step = it; if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step); error = "" },
+                        onChange = { changeEditor(current, it); error = "" }, onStep = { step = it; if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step); error = "" },
                         onPickPhotos = { picker.launch("image/*") }, onPhoto = { photoPath = it },
                         onTakePhoto = { cameraJobId = current.id; photoCamera.launch(Intent(this@MainActivity, PhotoCaptureActivity::class.java)) },
                         onRemovePhoto = { path ->
-                            changeEditor(current.copy(photos = current.photos - path))
-                            val usedPhotos = jobs.flatMap { it.photos }.toSet() + drafts.flatMap { it.photos }
-                            deleteUnusedPhotos(listOf(path), usedPhotos)
+                            store.transaction {
+                                changeEditor(current, current.copy(photos = current.photos - path))
+                                deleteUnusedPhotos(listOf(path))
+                            }
                         }, onNavigate = { navigate(current.address) },
                         onFinish = {
-                            val problem = validationError(current)
-                            if (problem != null) {
-                                error = problem
-                                step = when {
-                                    current.clients.none { it.name.isNotBlank() } || current.clients.any { !validPhone(it.phone) || (it.name.isBlank() && it.phone.isNotBlank()) } -> 0
-                                    current.workers.any { !validPhone(it.phone) || (it.name.isBlank() && (it.phone.isNotBlank() || it.work.isNotBlank())) || (it.name.isNotBlank() && it.work.isBlank()) } -> 5
-                                    current.inventory.any { !validMaterialPrice(it.price) || (it.name.isBlank() && (it.quantity.isNotBlank() || it.notes.isNotBlank() || it.price.isNotBlank())) } -> 4
-                                    else -> 2
-                                }
-                                if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step)
-                            } else if (editingId.isBlank()) {
-                                val saved = current.copy(clients = current.clients.filter { it.name.isNotBlank() },
-                                    workers = current.workers.filter { it.name.isNotBlank() || it.phone.isNotBlank() || it.work.isNotBlank() },
-                                    inventory = current.inventory.filter { it.name.isNotBlank() },
-                                    priority = (jobs.maxOfOrNull { it.priority } ?: -1) + 1, updatedAt = System.currentTimeMillis())
-                                val previousJobs = store.jobs()
-                                val finished = store.finishDraft(saved)
+                            if (editingId.isBlank()) {
+                                val finished = store.finishDraft(current.id)
                                 jobs = store.jobs()
                                 drafts = store.drafts()
-                                activeDraftId = ""; editor = null
-                                if (finished) {
-                                    selectedId = saved.id; screen = "detail"
-                                    if (previousJobs.none { it.state == Job.ACTIVE || it.id == saved.id }) activateId = saved.id
-                                } else {
-                                    screen = "drafts"
-                                    message = "This draft is no longer available."
+                                when (finished) {
+                                    is DraftFinishResult.Invalid -> {
+                                        editor = finished.draft
+                                        editorError(finished.draft, finished.message)
+                                    }
+                                    is DraftFinishResult.Saved -> {
+                                        activeDraftId = ""; editor = null
+                                        selectedId = current.id; screen = "detail"
+                                        if (finished.suggestActivation) activateId = current.id
+                                    }
+                                    DraftFinishResult.Missing -> {
+                                        activeDraftId = ""; editor = null
+                                        screen = "drafts"
+                                        message = "This draft is no longer available."
+                                    }
                                 }
-                            } else { editor = null; selectedId = editingId; screen = "detail" }
+                            } else {
+                                val problem = validationError(current)
+                                if (problem != null) editorError(current, problem)
+                                else { editor = null; selectedId = editingId; screen = "detail" }
+                            }
                         })
                 }
                 "share" -> jobs.firstOrNull { it.id == selectedId }?.let { ShareScreen(it, area) }
@@ -591,13 +719,13 @@ class MainActivity : ComponentActivity() {
             AlertDialog(onDismissRequest = { latestRelease = null },
                 title = { Text(if (newer) "Update available" else "JobTracker is up to date") },
                 text = { Text("Installed: v$installedVersion\nLatest release: ${release.tag}" +
-                    if (newer) "\n\nDownload the APK, then tap the completed download notification to install it. Android may ask you to allow installs from JobTracker." else "") },
+                    if (newer) "\n\nJobTracker will show what's new when the update is ready to install." else "") },
                 confirmButton = {
                     TextButton(onClick = {
                         if (newer) {
                             try {
-                                downloadRelease(this@MainActivity, release)
-                                message = "Downloading ${release.tag}. Tap its notification when the download finishes to install it. Allow installs from JobTracker if Android asks."
+                                val id = downloadRelease(this@MainActivity, release)
+                                trackDownload(ReleaseDownload(id, release.tag, release.highlights))
                             } catch (_: Exception) {
                                 message = "Couldn't start the update download. Please try again."
                             }
@@ -606,6 +734,44 @@ class MainActivity : ComponentActivity() {
                     }) { Text(if (newer) "Download APK" else "OK") }
                 },
                 dismissButton = if (newer) ({ TextButton(onClick = { latestRelease = null }) { Text("Cancel") } }) else null)
+        }
+        if (download != null && downloadReady && !download.deferred && screen == "home" &&
+            !checkingUpdate && latestRelease == null && message.isBlank() && !menuExpanded &&
+            activateId == null && deleteDraftId == null && !clearAllData &&
+            completeId == null && deleteJobId == null && photoPath == null && !creatingPdf
+        ) {
+            val dismiss = { trackDownload(download.copy(deferred = true)) }
+            AlertDialog(
+                onDismissRequest = dismiss,
+                title = { Text("What's new in ${download.tag}") },
+                text = {
+                    Column(Modifier.verticalScroll(rememberScrollState())) {
+                        Text(download.highlights.ifBlank { "The update is ready to install." })
+                        TextButton(onClick = {
+                            val url = Uri.parse("https://github.com/evan6509/JobTracker/releases/tag/${download.tag}")
+                            launch(Intent(Intent.ACTION_VIEW, url), "Couldn't open the release notes.")
+                        }) { Text("Full release notes") }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        dismiss()
+                        scope.launch {
+                            try {
+                                installRelease(this@MainActivity, download.id)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: UpdateApkUnavailableException) {
+                                discardDownload(download.id)
+                                message = "The update file is missing. Check for updates to download it again."
+                            } catch (_: Exception) {
+                                message = "Couldn't open the installer. Open Install downloaded update from the menu to try again."
+                            }
+                        }
+                    }) { Text("Install now") }
+                },
+                dismissButton = { TextButton(onClick = dismiss) { Text("Later") } }
+            )
         }
         if (message.isNotBlank()) AlertDialog(onDismissRequest = { message = "" }, title = { Text("JobTracker") },
             text = { Text(message) }, confirmButton = { TextButton(onClick = { message = "" }) { Text("OK") } })

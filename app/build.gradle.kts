@@ -52,6 +52,8 @@ android {
 }
 
 dependencies {
+    implementation(project(":ukey2"))
+    testImplementation("org.robolectric:robolectric:4.16.1")
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)

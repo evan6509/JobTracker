@@ -24,3 +24,6 @@ dependencyResolutionManagement {
 
 rootProject.name = "Job Tracker"
 include(":app")
+
+include(":ukey2")
+project(":ukey2").projectDir = file("third_party/ukey2")
