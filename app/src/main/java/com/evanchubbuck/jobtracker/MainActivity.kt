@@ -269,8 +269,7 @@ class MainActivity : ComponentActivity() {
             val usedPhotos = jobs.flatMap { it.photos }.toSet() + drafts.flatMap { it.photos }
             deleteUnusedPhotos(removed.flatMap { it.job.photos }, usedPhotos)
         }
-        fun changeEditor(value: Job) {
-            val before = editor ?: return
+        fun changeEditor(before: Job, value: Job): Job? {
             val changed = value.copy(updatedAt = System.currentTimeMillis())
             if (editingId.isBlank()) {
                 editor = store.applyDraftChange(before, changed)
@@ -280,6 +279,17 @@ class MainActivity : ComponentActivity() {
                 jobs = store.jobs()
                 editor = jobs.firstOrNull { it.id == editingId }
             }
+            return editor
+        }
+        fun editorError(job: Job, problem: String) {
+            error = problem
+            step = when {
+                job.clients.none { it.name.isNotBlank() } || job.clients.any { !validPhone(it.phone) || (it.name.isBlank() && it.phone.isNotBlank()) } -> 0
+                job.workers.any { !validPhone(it.phone) || (it.name.isBlank() && (it.phone.isNotBlank() || it.work.isNotBlank())) || (it.name.isNotBlank() && it.work.isBlank()) } -> 5
+                job.inventory.any { !validMaterialPrice(it.price) || (it.name.isBlank() && (it.quantity.isNotBlank() || it.notes.isNotBlank() || it.price.isNotBlank())) } -> 4
+                else -> 2
+            }
+            if (editingId.isBlank()) store.saveDraftStep(job.id, step)
         }
         fun openEditor(id: String = "", section: Int = 0) {
             editingId = id
@@ -383,12 +393,14 @@ class MainActivity : ComponentActivity() {
                 val editSession = editingId
                 scope.launch {
                     val count = importJobPhotos(uris, { copyPhoto(this@MainActivity, it) }) { paths ->
-                        val latest = editor ?: if (editingId.isBlank()) drafts.firstOrNull { it.id == activeDraftId }
-                            else jobs.firstOrNull { it.id == editingId }
-                        if (latest?.id == current.id && editingId == editSession && screen == "editor") {
-                            changeEditor(latest.copy(photos = latest.photos + paths))
-                            true
-                        } else false
+                        if (paths.isEmpty() || current.id != editingId.ifBlank { activeDraftId } ||
+                            editingId != editSession || screen != "editor") return@importJobPhotos false
+                        store.transaction {
+                            val records = if (editSession.isBlank()) store.drafts() else store.jobs()
+                            val latest = records.firstOrNull { it.id == current.id } ?: return@transaction false
+                            val updated = changeEditor(latest, latest.copy(photos = latest.photos + paths))
+                            updated?.photos?.containsAll(paths) == true
+                        }
                     }
                     if (count != uris.size) message = "Some photos could not be added."
                 }
@@ -594,43 +606,40 @@ class MainActivity : ComponentActivity() {
                 "editor" -> {
                     val current = editor ?: if (editingId.isBlank()) drafts.firstOrNull { it.id == activeDraftId } else jobs.firstOrNull { it.id == editingId }
                     if (current != null) EditorScreen(current, step, editingId.isNotBlank(), error, area,
-                        onChange = { changeEditor(it); error = "" }, onStep = { step = it; if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step); error = "" },
+                        onChange = { changeEditor(current, it); error = "" }, onStep = { step = it; if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step); error = "" },
                         onPickPhotos = { picker.launch("image/*") }, onPhoto = { photoPath = it },
                         onTakePhoto = { cameraJobId = current.id; photoCamera.launch(Intent(this@MainActivity, PhotoCaptureActivity::class.java)) },
                         onRemovePhoto = { path ->
-                            changeEditor(current.copy(photos = current.photos - path))
+                            changeEditor(current, current.copy(photos = current.photos - path))
                             val usedPhotos = jobs.flatMap { it.photos }.toSet() + drafts.flatMap { it.photos }
                             deleteUnusedPhotos(listOf(path), usedPhotos)
                         }, onNavigate = { navigate(current.address) },
                         onFinish = {
-                            val problem = validationError(current)
-                            if (problem != null) {
-                                error = problem
-                                step = when {
-                                    current.clients.none { it.name.isNotBlank() } || current.clients.any { !validPhone(it.phone) || (it.name.isBlank() && it.phone.isNotBlank()) } -> 0
-                                    current.workers.any { !validPhone(it.phone) || (it.name.isBlank() && (it.phone.isNotBlank() || it.work.isNotBlank())) || (it.name.isNotBlank() && it.work.isBlank()) } -> 5
-                                    current.inventory.any { !validMaterialPrice(it.price) || (it.name.isBlank() && (it.quantity.isNotBlank() || it.notes.isNotBlank() || it.price.isNotBlank())) } -> 4
-                                    else -> 2
-                                }
-                                if (editingId.isBlank()) store.saveDraftStep(activeDraftId, step)
-                            } else if (editingId.isBlank()) {
-                                val saved = current.copy(clients = current.clients.filter { it.name.isNotBlank() },
-                                    workers = current.workers.filter { it.name.isNotBlank() || it.phone.isNotBlank() || it.work.isNotBlank() },
-                                    inventory = current.inventory.filter { it.name.isNotBlank() },
-                                    priority = (jobs.maxOfOrNull { it.priority } ?: -1) + 1, updatedAt = System.currentTimeMillis())
-                                val previousJobs = store.jobs()
-                                val finished = store.finishDraft(saved)
+                            if (editingId.isBlank()) {
+                                val finished = store.finishDraft(current.id)
                                 jobs = store.jobs()
                                 drafts = store.drafts()
-                                activeDraftId = ""; editor = null
-                                if (finished) {
-                                    selectedId = saved.id; screen = "detail"
-                                    if (previousJobs.none { it.state == Job.ACTIVE || it.id == saved.id }) activateId = saved.id
-                                } else {
-                                    screen = "drafts"
-                                    message = "This draft is no longer available."
+                                when (finished) {
+                                    is DraftFinishResult.Invalid -> {
+                                        editor = finished.draft
+                                        editorError(finished.draft, finished.message)
+                                    }
+                                    is DraftFinishResult.Saved -> {
+                                        activeDraftId = ""; editor = null
+                                        selectedId = current.id; screen = "detail"
+                                        if (finished.suggestActivation) activateId = current.id
+                                    }
+                                    DraftFinishResult.Missing -> {
+                                        activeDraftId = ""; editor = null
+                                        screen = "drafts"
+                                        message = "This draft is no longer available."
+                                    }
                                 }
-                            } else { editor = null; selectedId = editingId; screen = "detail" }
+                            } else {
+                                val problem = validationError(current)
+                                if (problem != null) editorError(current, problem)
+                                else { editor = null; selectedId = editingId; screen = "detail" }
+                            }
                         })
                 }
                 "share" -> jobs.firstOrNull { it.id == selectedId }?.let { ShareScreen(it, area) }

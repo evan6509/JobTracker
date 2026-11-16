@@ -219,23 +219,33 @@ class JobStore(context: Context) {
         prefs.edit().remove("draft_step_$id").apply()
     }
 
-    /** Finish once, retaining a saved copy if an older synced draft still exists. */
-    fun finishDraft(job: Job): Boolean = transaction {
+    /** Finish the current stored draft, retaining a saved copy if one already exists. */
+    internal fun finishDraft(id: String): DraftFinishResult = transaction {
         val existingDrafts = drafts()
-        val draft = existingDrafts.firstOrNull { it.id == job.id } ?: return false
+        val draft = existingDrafts.firstOrNull { it.id == id } ?: return DraftFinishResult.Missing
         val existingJobs = jobs()
-        val saved = existingJobs.firstOrNull { it.id == job.id }
-        val result = saved ?: job.copy(updatedAt = localRevision(draft, job))
+        val saved = existingJobs.firstOrNull { it.id == id }
+        val result = saved ?: run {
+            validationError(draft)?.let { return DraftFinishResult.Invalid(draft, it) }
+            val finished = draft.copy(
+                clients = draft.clients.filter { it.name.isNotBlank() },
+                workers = draft.workers.filter { it.name.isNotBlank() || it.phone.isNotBlank() || it.work.isNotBlank() },
+                inventory = draft.inventory.filter { it.name.isNotBlank() },
+                priority = (existingJobs.maxOfOrNull { it.priority } ?: -1) + 1,
+                updatedAt = System.currentTimeMillis()
+            )
+            finished.copy(updatedAt = localRevision(draft, finished))
+        }
         val stamps = if (saved != null) fieldStamps(saved) else changedFieldStamps(draft, result)
         val priceStamps = if (saved != null) materialPriceStamps(saved) else changedPriceStamps(draft, result)
         val editor = prefs.edit()
             .putString("jobs", jobsJson(if (saved != null) existingJobs else existingJobs + result))
-            .putString("field_updated_${job.id}", fieldStampsJson(stamps))
-            .putString("price_updated_${job.id}", priceStampsJson(priceStamps))
-            .remove("draft_step_${job.id}")
-        writeDrafts(editor, existingDrafts.filterNot { it.id == job.id })
+            .putString("field_updated_$id", fieldStampsJson(stamps))
+            .putString("price_updated_$id", priceStampsJson(priceStamps))
+            .remove("draft_step_$id")
+        writeDrafts(editor, existingDrafts.filterNot { it.id == id })
         editor.apply()
-        return true
+        DraftFinishResult.Saved(suggestActivation = saved == null && existingJobs.none { it.state == Job.ACTIVE })
     }
 
     fun saveDrafts(drafts: List<Job>): Unit = transaction {
@@ -410,6 +420,12 @@ internal data class SyncStoreSnapshot(
     val fields: Map<String, Map<SyncCategory, Long>>, val prices: Map<String, Map<String, Long>>,
     val steps: Map<String, Int>
 )
+
+internal sealed interface DraftFinishResult {
+    data class Saved(val suggestActivation: Boolean) : DraftFinishResult
+    data class Invalid(val draft: Job, val message: String) : DraftFinishResult
+    data object Missing : DraftFinishResult
+}
 
 private fun Person.toJson() = JSONObject().put("name", name).put("phone", phone).put("work", work)
 private fun JSONObject.toPerson() = Person(optString("name"), optString("phone"), optString("work"))

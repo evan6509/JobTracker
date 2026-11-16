@@ -183,6 +183,31 @@ class StoreRegressionTest {
         assertTrue(target.fieldStamps(edited).getValue(SyncCategory.NAME) > 5000)
     }
 
+    @Test fun finishingDraftUsesLatestReceivedDetailsAndPhoto() = phones { sc, source, tc, target ->
+        val localPhoto = File(File(tc.filesDir, "photos").apply { mkdirs() }, "local.jpg").apply { writeText("old") }
+        val remotePhoto = File(File(sc.filesDir, "photos").apply { mkdirs() }, "remote.jpg").apply { writeText("new") }
+        val item = InventoryItem(id = "material", name = "Paint", price = "10")
+        val draft = Job(id = "draft", clients = listOf(Person("Client")), address = "Old site",
+            inventory = listOf(item), photos = listOf(localPhoto.path), updatedAt = 1000)
+        target.saveDraft(draft)
+        val staleEditor = target.drafts().single()
+        target.saveJobs(listOf(Job(id = "other", priority = 7)))
+        source.saveDraft(draft.copy(address = "Received site", inventory = listOf(item.copy(price = "25")),
+            photos = listOf(remotePhoto.path), updatedAt = 2000))
+        val archive = SyncArchive.create(sc, source, SyncSelection(drafts = mapOf(draft.id to SyncCategory.entries.toSet())))
+        try {
+            SyncArchive.merge(tc, target, archive)
+            assertFalse(localPhoto.exists())
+            assertTrue(target.finishDraft(staleEditor.id) is DraftFinishResult.Saved)
+            val saved = target.jobs().first { it.id == draft.id }
+            assertEquals("Received site", saved.address)
+            assertEquals("25", saved.inventory.single().price)
+            assertEquals("new", File(saved.photos.single()).readText())
+            assertEquals(8, saved.priority)
+            assertTrue(target.drafts().isEmpty())
+        } finally { archive.delete() }
+    }
+
     @Test fun relayModifiedArchiveCannotReachPersistence() = phones { sc, source, tc, target ->
         val local = Job(id = "local", title = "Keep")
         target.saveJobs(listOf(local))
