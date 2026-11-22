@@ -319,8 +319,8 @@ internal fun SyncScreen(sync: WifiDirectSync, jobs: List<Job>, drafts: List<Job>
                 Text(sync.code.orEmpty(), color = UiInk, style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold)
                 Text("Confirm only if this code matches on the other phone.", color = muted)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { sync.confirm(true) }) { Text("Codes match") }
-                    OutlinedButton(onClick = { sync.confirm(false) }) { Text("Cancel") }
+                    Button(onClick = sync::confirm) { Text("Codes match") }
+                    OutlinedButton(onClick = sync::cancelTransfer) { Text("Cancel") }
                 }
             } else if (sync.result == null && !sync.busy) {
                 OutlinedButton(onClick = sync::discover, modifier = Modifier.fillMaxWidth()) { Text("Search again") }
